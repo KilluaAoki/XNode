@@ -20,7 +20,6 @@ import (
 	"github.com/KilluaAoki/XNode/common/nlog"
 	"github.com/KilluaAoki/XNode/conf"
 	"github.com/go-viper/mapstructure/v2"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 var (
@@ -231,7 +230,6 @@ func decodeWeakRaw(input map[string]interface{}, output interface{}) error {
 		WeaklyTypedInput: true,
 		TagName:          "json",
 		DecodeHook: mapstructure.ComposeDecodeHookFunc(
-			compatDecodeHook,
 			func(f, t reflect.Type, v interface{}) (interface{}, error) {
 				if t == reflect.TypeOf(StringOrArray("")) && f.Kind() == reflect.Slice {
 					arr, _ := v.([]interface{})
@@ -328,10 +326,8 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 	return &cfg, nil
 }
 
-// GetUsers asks for msgpack, which some v2board forks support for large
-// user lists; panels that ignore the header answer with JSON.
 func (c *Client) GetUsers() ([]User, error) {
-	resp, err := c.doRequestHeaders("GET", c.userPath(), nil, c.userETag, msgpackAccept)
+	resp, err := c.doRequest("GET", c.userPath(), nil, c.userETag)
 	if err != nil {
 		return nil, fmt.Errorf("get users: %w", err)
 	}
@@ -346,13 +342,7 @@ func (c *Client) GetUsers() ([]User, error) {
 	}
 
 	var usersResp UsersResponse
-	if strings.Contains(resp.Header.Get("Content-Type"), "msgpack") {
-		dec := msgpack.NewDecoder(resp.Body)
-		dec.SetCustomStructTag("json")
-		if err := dec.Decode(&usersResp); err != nil {
-			return nil, fmt.Errorf("decode msgpack: %w", err)
-		}
-	} else if err := json.NewDecoder(resp.Body).Decode(&usersResp); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&usersResp); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
 
@@ -553,18 +543,12 @@ var (
 	getRetryDelay    = time.Second
 )
 
-var msgpackAccept = map[string]string{"X-Response-Format": "msgpack"}
-
 func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string) (*http.Response, error) {
-	return c.doRequestHeaders(method, path, body, ifNoneMatch, nil)
-}
-
-func (c *Client) doRequestHeaders(method, path string, body []byte, ifNoneMatch string, headers map[string]string) (*http.Response, error) {
 	if method != "GET" {
-		return c.doRequestOnce(method, path, body, ifNoneMatch, headers)
+		return c.doRequestOnce(method, path, body, ifNoneMatch)
 	}
 	for attempt := 1; ; attempt++ {
-		resp, err := c.doRequestOnce(method, path, body, ifNoneMatch, headers)
+		resp, err := c.doRequestOnce(method, path, body, ifNoneMatch)
 		if attempt >= getRetryAttempts || !retryableGET(resp, err) {
 			return resp, err
 		}
@@ -584,7 +568,7 @@ func retryableGET(resp *http.Response, err error) bool {
 	return resp.StatusCode >= 500
 }
 
-func (c *Client) doRequestOnce(method, path string, body []byte, ifNoneMatch string, headers map[string]string) (*http.Response, error) {
+func (c *Client) doRequestOnce(method, path string, body []byte, ifNoneMatch string) (*http.Response, error) {
 	fullURL := c.baseURL + path
 
 	var bodyReader io.Reader
@@ -608,9 +592,6 @@ func (c *Client) doRequestOnce(method, path string, body []byte, ifNoneMatch str
 	req.Header.Set("Accept", "application/json")
 	if ifNoneMatch != "" {
 		req.Header.Set("If-None-Match", ifNoneMatch)
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
 	}
 
 	nlog.Core().Debug("panel request", "method", method, "path", path)

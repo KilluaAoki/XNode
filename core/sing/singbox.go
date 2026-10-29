@@ -60,17 +60,6 @@ func (s *SingBox) TotalConnections() int64 { return s.totalConns.Load() }
 
 func (s *SingBox) Name() string { return "sing-box" }
 
-func (s *SingBox) Capabilities() core.Capabilities {
-	return core.Capabilities{
-		PerUserSpeedLimit:    true,
-		DeviceLimit:          true,
-		BuiltInTrafficStats:  false,
-		AliveIPTracking:      true,
-		ForceCloseConnection: false,
-		ForceCloseUser:       true,
-	}
-}
-
 func (s *SingBox) Protocols() []string {
 	return []string{
 		"vmess", "vless", "trojan", "shadowsocks",
@@ -486,26 +475,6 @@ func (s *SingBox) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, a
 	}
 	traffic, aliveIPs, connCount = ct.GetUserTraffic()
 	return traffic, aliveIPs, connCount, nil
-}
-
-func (s *SingBox) CloseConnection(_ context.Context, connID string) error {
-	ct := s.connTrackerSafe()
-	if ct == nil {
-		return fmt.Errorf("not running")
-	}
-	if !ct.CloseByID(connID) {
-		nlog.Core().Debug("CloseConnection: connection not found (already closed?)", "id", connID)
-	}
-	return nil
-}
-
-func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
-	ct := s.connTrackerSafe()
-	if ct == nil {
-		return nil
-	}
-	ct.CloseByUUID(uuid)
-	return nil
 }
 
 func buildUserMap(users []core.UserSpec) map[string]int {

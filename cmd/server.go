@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime/debug"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -58,8 +56,11 @@ func serve(args []string) error {
 	}
 	conf.InitLogger(instances[0].Log)
 	nlog.Core().Info("starting", "version", version)
-
-	applyRuntimeConfig(instances[0].Runtime)
+	if backup, err := conf.MigrateConfigFile(*configPath); err != nil {
+		nlog.Core().Warn("failed to migrate config file to the nodes list", "path", *configPath, "error", err)
+	} else if backup != "" {
+		nlog.Core().Info("migrated config file to the nodes list", "path", *configPath, "backup", backup)
+	}
 
 	runWithReload(rootCfg, *configPath)
 	return nil
@@ -242,60 +243,7 @@ func runWithReload(initialRoot *conf.RootConfig, configPath string) {
 			os.Exit(1)
 		}
 		conf.InitLogger(newInstances[0].Log)
-		applyRuntimeConfig(newInstances[0].Runtime)
 		root = newRoot
 		nlog.Core().Info("reload complete, services restarting with new config")
 	}
-}
-
-func applyRuntimeConfig(rt conf.RuntimeConfig) {
-	if rt.GoGCPercent > 0 {
-		prev := debug.SetGCPercent(rt.GoGCPercent)
-		nlog.Core().Info("runtime: GOGC set", "gogc", rt.GoGCPercent, "prev", prev)
-	}
-
-	if rt.GoMemLimit != "" {
-		limit, err := parseMemLimit(rt.GoMemLimit)
-		if err != nil {
-			nlog.Core().Warn("runtime: invalid gomemlimit, ignoring", "value", rt.GoMemLimit, "error", err)
-		} else {
-			prev := debug.SetMemoryLimit(limit)
-			nlog.Core().Info("runtime: GOMEMLIMIT set",
-				"limit", rt.GoMemLimit,
-				"bytes", limit,
-				"prev_bytes", prev,
-			)
-		}
-	}
-}
-
-func parseMemLimit(s string) (int64, error) {
-	s = strings.TrimSpace(s)
-	suffixes := []struct {
-		suffix string
-		mult   int64
-	}{
-		{"TiB", 1 << 40},
-		{"GiB", 1 << 30},
-		{"MiB", 1 << 20},
-		{"KiB", 1 << 10},
-		{"B", 1},
-	}
-	upper := strings.ToUpper(s)
-	for _, sf := range suffixes {
-		if strings.HasSuffix(upper, strings.ToUpper(sf.suffix)) {
-			numStr := strings.TrimSuffix(upper, strings.ToUpper(sf.suffix))
-			numStr = strings.TrimSpace(numStr)
-			var n int64
-			if _, err := fmt.Sscanf(numStr, "%d", &n); err != nil {
-				return 0, fmt.Errorf("parse number %q: %w", numStr, err)
-			}
-			return n * sf.mult, nil
-		}
-	}
-	var n int64
-	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
-		return 0, fmt.Errorf("unrecognised size format %q", s)
-	}
-	return n, nil
 }

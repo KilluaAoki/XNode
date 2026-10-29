@@ -2,6 +2,7 @@ package node
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 
 	"github.com/KilluaAoki/XNode/conf"
@@ -15,6 +16,14 @@ func validateNodeRuntime(cfg *conf.Config, kcfgSupported []string, spec *core.No
 	}
 	if !containsString(kcfgSupported, spec.Protocol) {
 		return fmt.Errorf("protocol %q is not supported by kernel %q", spec.Protocol, cfg.Kernel.Type)
+	}
+	if spec.ListenIP != "" {
+		if _, err := netip.ParseAddr(spec.ListenIP); err != nil {
+			return fmt.Errorf("listen_ip %q is not an IP address", spec.ListenIP)
+		}
+	}
+	if spec.Protocol == "shadowsocks" && spec.Plugin != "" {
+		return fmt.Errorf("shadowsocks plugin %q is not supported; clear the plugin setting on the panel", spec.Plugin)
 	}
 	if err := validateTLSRequirements(spec, tls, cfgKernelType(cfg)); err != nil {
 		return err

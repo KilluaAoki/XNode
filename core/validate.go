@@ -21,7 +21,7 @@ func ValidateNodeSpec(n *NodeSpec, kcfg conf.KernelConfig) error {
 		return fmt.Errorf("normalize kernel type: %w", err)
 	}
 
-	additionalOutboundSources, err := collectAdditionalOutboundTagSources(kcfg.CustomConfig, kcfg.CustomOutbound)
+	additionalOutboundSources, err := collectCustomConfigOutboundTagSources(kcfg.CustomConfig)
 	if err != nil {
 		return fmt.Errorf("collect additional outbound tags: %w", err)
 	}

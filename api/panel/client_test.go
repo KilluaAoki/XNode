@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/KilluaAoki/XNode/conf"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 func newTestServer(handler http.HandlerFunc) (*httptest.Server, *Client) {
@@ -542,38 +541,6 @@ func TestGetAliveList_Unsupported(t *testing.T) {
 	}
 }
 
-func TestGetUsers_Msgpack(t *testing.T) {
-	ts, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Response-Format") != "msgpack" {
-			t.Errorf("X-Response-Format = %q", r.Header.Get("X-Response-Format"))
-		}
-		body, err := msgpack.Marshal(map[string]any{
-			"users": []map[string]any{
-				{"id": 1, "uuid": "uuid-1", "speed_limit": 3, "device_limit": 2},
-				{"id": 2, "uuid": "uuid-2"},
-			},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		w.Header().Set("Content-Type", "application/x-msgpack")
-		w.Header().Set("ETag", `"mp-etag"`)
-		w.Write(body)
-	})
-	defer ts.Close()
-
-	users, err := client.GetUsers()
-	if err != nil {
-		t.Fatalf("GetUsers: %v", err)
-	}
-	if len(users) != 2 || users[0].UUID != "uuid-1" || users[0].SpeedLimit != 3 || users[0].DeviceLimit != 2 || users[1].ID != 2 {
-		t.Fatalf("users = %+v", users)
-	}
-	if client.userETag != `"mp-etag"` {
-		t.Errorf("userETag = %q", client.userETag)
-	}
-}
-
 func TestNewClient_Timeout(t *testing.T) {
 	if got := NewClient(conf.PanelConfig{}).httpClient.Timeout; got != defaultHTTPTimeout {
 		t.Errorf("default timeout = %v", got)
@@ -589,7 +556,7 @@ func TestDoRequest_ErrorRedactsToken(t *testing.T) {
 	ts.Close()
 
 	client := NewClient(conf.PanelConfig{URL: baseURL, Token: "secret-token", NodeID: 1})
-	_, err := client.doRequestOnce("GET", "/api/v1/server/UniProxy/config", nil, "", nil)
+	_, err := client.doRequestOnce("GET", "/api/v1/server/UniProxy/config", nil, "")
 	if err == nil {
 		t.Fatal("expected error from closed server")
 	}

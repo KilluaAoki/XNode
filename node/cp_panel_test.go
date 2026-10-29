@@ -15,7 +15,7 @@ func TestPanelControlPlaneInitialRejectsInvalidCustomOutbounds(t *testing.T) {
 	server := newPanelTestServer(`{"protocol":"shadowsocks","server_port":8388,"custom_outbounds":[{"tag":"proxy","protocol":"socks","proxy_tag":"missing","settings":{"server":"2.2.2.2","server_port":1080}}]}`)
 	defer server.Close()
 
-	cp := NewPanelControlPlane(conf.PanelConfig{URL: server.URL, Token: "token", NodeID: 1}, conf.WSConfig{}, conf.KernelConfig{Type: "singbox"})
+	cp := NewPanelControlPlane(conf.PanelConfig{URL: server.URL, Token: "token", NodeID: 1}, conf.KernelConfig{Type: "singbox"})
 	_, err := cp.Initial(context.Background(), nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -29,7 +29,7 @@ func TestPanelControlPlanePollRejectsInvalidCustomOutbounds(t *testing.T) {
 	server := newPanelTestServer(`{"protocol":"shadowsocks","server_port":8388,"custom_outbounds":[{"tag":"proxy","protocol":"socks","proxy_tag":"missing","settings":{"server":"2.2.2.2","server_port":1080}}]}`)
 	defer server.Close()
 
-	cp := NewPanelControlPlane(conf.PanelConfig{URL: server.URL, Token: "token", NodeID: 1}, conf.WSConfig{}, conf.KernelConfig{Type: "singbox"})
+	cp := NewPanelControlPlane(conf.PanelConfig{URL: server.URL, Token: "token", NodeID: 1}, conf.KernelConfig{Type: "singbox"})
 	_, err := cp.Poll(context.Background())
 	if err == nil {
 		t.Fatal("expected error, got nil")

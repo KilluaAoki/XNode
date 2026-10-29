@@ -12,7 +12,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=bind,target=. \
     GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
-    -tags "with_quic with_utls with_wireguard with_acme with_clash_api" \
+    -tags "with_quic with_utls with_wireguard with_acme" \
     -ldflags "-X main.version=${VERSION} -s -w -buildid=" \
     -o /out/xnode .
 

@@ -399,3 +399,26 @@ func TestLimitDispatcher_TotalConnections(t *testing.T) {
 		t.Errorf("active = %d, want 0", ld.connCount.Load())
 	}
 }
+
+func TestLimitDispatcher_ConnectionStateConcurrentWithLinks(t *testing.T) {
+	ld := newTestDispatcher()
+	ld.SetDeviceGate(core.NewDeviceGate())
+	ld.UpdateLimits(map[string]int{"user@1": 1}, map[string]int{"user@1": 100}, nil)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 2000; i++ {
+			ld.checkDeviceLimit("user@1", "1.1.1.1", true)
+			ld.delConn("user@1", "1.1.1.1")
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			return
+		default:
+			ld.GetConnectionState()
+		}
+	}
+}

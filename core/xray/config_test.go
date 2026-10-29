@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/KilluaAoki/XNode/api/panel"
@@ -35,12 +37,7 @@ func testRouteRules(r []panel.RouteRule) []core.RouteRule {
 }
 
 func TestBuildConfig_OutboundPriority(t *testing.T) {
-	kcfg := conf.KernelConfig{
-		LogLevel: "info",
-		CustomOutbound: []map[string]any{
-			{"tag": "block", "protocol": "dns"},
-		},
-	}
+	kcfg := conf.KernelConfig{LogLevel: "info"}
 	nc := &panel.NodeConfig{
 		Protocol:   "shadowsocks",
 		ServerPort: 111,
@@ -70,8 +67,8 @@ func TestBuildConfig_OutboundPriority(t *testing.T) {
 		}
 		if tag == "block" {
 			foundBlock = true
-			if o["protocol"] != "dns" {
-				t.Errorf("expected 'block' protocol to be 'dns' (static config priority), got %v", o["protocol"])
+			if o["protocol"] != "blackhole" {
+				t.Errorf("expected default 'block' outbound, got %v", o["protocol"])
 			}
 		}
 	}
@@ -562,26 +559,42 @@ func TestExtractECHServerKeys(t *testing.T) {
 }
 
 func TestBuildConfig_CustomDirectBecomesDefaultOutbound(t *testing.T) {
-	kcfg := conf.KernelConfig{
-		CustomOutbound: []map[string]any{
-			{"tag": "direct", "protocol": "freedom", "sendThrough": "10.0.0.2"},
-		},
-	}
 	nc := &panel.NodeConfig{
 		Protocol:   "shadowsocks",
 		ServerPort: 111,
 		Cipher:     "aes-128-gcm",
 		CustomOutbounds: []panel.OutboundConfig{
 			{Tag: "warp", Protocol: "socks", Settings: map[string]any{"address": "1.2.3.4"}},
+			{Tag: "direct", Protocol: "freedom"},
 		},
 	}
 
-	outbounds := buildConfig(kcfg, testNodeSpec(nc), testUsers, core.TLSCert{})["outbounds"].([]M)
-	if outbounds[0]["tag"] != "direct" || outbounds[0]["sendThrough"] != "10.0.0.2" {
+	outbounds := buildConfig(conf.KernelConfig{}, testNodeSpec(nc), testUsers, core.TLSCert{})["outbounds"].([]M)
+	if outbounds[0]["tag"] != "direct" || outbounds[0]["protocol"] != "freedom" {
 		t.Fatalf("first outbound = %v, want custom direct", outbounds[0])
 	}
 	if len(outbounds) != 3 || outbounds[1]["tag"] != "warp" {
 		t.Fatalf("outbounds = %v", outbounds)
+	}
+}
+
+func TestBuildConfig_CustomConfigReplacesDirect(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "custom.yaml")
+	data := "outbounds:\n  - {tag: direct, protocol: freedom, sendThrough: 10.0.0.2}\n  - {tag: extra, protocol: blackhole}\n"
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nc := &panel.NodeConfig{Protocol: "shadowsocks", ServerPort: 111, Cipher: "aes-128-gcm"}
+
+	outbounds := buildConfig(conf.KernelConfig{CustomConfig: path}, testNodeSpec(nc), testUsers, core.TLSCert{})["outbounds"].([]M)
+	if len(outbounds) != 3 {
+		t.Fatalf("outbounds = %v", outbounds)
+	}
+	if outbounds[0]["tag"] != "direct" || outbounds[0]["sendThrough"] != "10.0.0.2" {
+		t.Fatalf("first outbound = %v, want custom direct", outbounds[0])
+	}
+	if outbounds[2]["tag"] != "extra" {
+		t.Fatalf("last outbound = %v, want extra", outbounds[2])
 	}
 }
 

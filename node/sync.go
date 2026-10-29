@@ -183,8 +183,9 @@ func (s *Service) handleWSEvent(ctx context.Context, event Event) {
 		s.lastConfig = event.Config
 		s.metricsMu.Unlock()
 		s.lastConfigHash = newConfigHash
+		s.applyIntervals(event.Config.PushInterval, event.Config.PullInterval)
 		s.applyRemoteOverrides(ctx, event.Config)
-		s.applyChanges(ctx, true, false)
+		s.applyChanges(ctx, true)
 
 	case EventSyncUsers:
 		if event.Users == nil {
@@ -291,6 +292,7 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 			s.lastConfig = result.config
 			s.metricsMu.Unlock()
 			s.lastConfigHash = result.configHash
+			s.applyIntervals(result.config.PushInterval, result.config.PullInterval)
 			if s.applyRemoteOverrides(ctx, result.config) {
 				configChanged = true
 			}
@@ -308,7 +310,7 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	}
 
 	if configChanged {
-		s.applyChanges(ctx, true, false)
+		s.applyChanges(ctx, true)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KilluaAoki/XNode/conf"
 	"github.com/KilluaAoki/XNode/core"
@@ -37,9 +38,8 @@ type fakeKernel struct {
 	remoteCounts map[int]int
 }
 
-func (f *fakeKernel) Name() string                    { return "fake" }
-func (f *fakeKernel) Protocols() []string             { return []string{"vless"} }
-func (f *fakeKernel) Capabilities() core.Capabilities { return core.Capabilities{} }
+func (f *fakeKernel) Name() string        { return "fake" }
+func (f *fakeKernel) Protocols() []string { return []string{"vless"} }
 func (f *fakeKernel) Start(nodeConfig *core.NodeSpec, users []core.UserSpec, tls core.TLSCert) error {
 	_, _, _ = nodeConfig, users, tls
 	f.startCalls++
@@ -86,14 +86,6 @@ func (f *fakeKernel) UpdateUsers(users []core.UserSpec) (int, int, error) {
 func (f *fakeKernel) GetUserTraffic(ctx context.Context) (map[int][2]int64, map[int]map[string]bool, int, error) {
 	_ = ctx
 	return nil, nil, 0, nil
-}
-func (f *fakeKernel) CloseConnection(ctx context.Context, connID string) error {
-	_, _ = ctx, connID
-	return nil
-}
-func (f *fakeKernel) CloseUserConnections(ctx context.Context, uuid string) error {
-	_, _ = ctx, uuid
-	return nil
 }
 func (f *fakeKernel) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) { f.speedLimitFunc = fn }
 func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool))  { f.deviceLimitFunc = fn }
@@ -402,5 +394,58 @@ func TestNodeLimitsCapUsers(t *testing.T) {
 	}
 	if limit, _ := s.limiter.GetDeviceLimitByUUID("c"); limit != 3 {
 		t.Errorf("limiter device limit = %d, want 3", limit)
+	}
+}
+
+func TestApplyIntervalsPrefersLocalThenPanel(t *testing.T) {
+	cfg := &conf.Config{}
+	cfg.Node.PullInterval = 45
+	s := &Service{cfg: cfg}
+
+	s.applyIntervals(0, 0)
+	if s.pushInterval != 60 || s.pullInterval != 45 {
+		t.Fatalf("defaults: push=%d pull=%d, want 60/45", s.pushInterval, s.pullInterval)
+	}
+
+	s.reportTicker = time.NewTicker(time.Hour)
+	defer s.reportTicker.Stop()
+	s.pullTicker = time.NewTicker(time.Hour)
+	defer s.pullTicker.Stop()
+
+	s.applyIntervals(1, 120)
+	if s.pushInterval != 1 || s.pullInterval != 45 {
+		t.Fatalf("panel update: push=%d pull=%d, want 1/45 (local pull pinned)", s.pushInterval, s.pullInterval)
+	}
+	select {
+	case <-s.reportTicker.C:
+	case <-time.After(10 * time.Second):
+		t.Fatal("report ticker was not retimed")
+	}
+
+	s.applyIntervals(0, 0)
+	if s.pushInterval != 1 {
+		t.Fatalf("missing panel value should keep current push, got %d", s.pushInterval)
+	}
+}
+
+func TestValidateNodeRuntimeListenIP(t *testing.T) {
+	cfg := &conf.Config{Kernel: conf.KernelConfig{Type: "xray"}}
+	for ip, ok := range map[string]bool{"": true, "0.0.0.0": true, "::": true, "127.0.0.1": true, "localhost": false, "0.0.0.0 ": false, "1.2.3.4:443": false} {
+		err := validateNodeRuntime(cfg, []string{"vmess"}, &core.NodeSpec{Protocol: "vmess", ListenIP: ip}, core.TLSCert{})
+		if (err == nil) != ok {
+			t.Errorf("listen_ip %q: err=%v, want ok=%v", ip, err, ok)
+		}
+	}
+}
+
+func TestValidateNodeRuntimeRejectsShadowsocksPlugin(t *testing.T) {
+	cfg := &conf.Config{Kernel: conf.KernelConfig{Type: "singbox"}}
+	spec := &core.NodeSpec{Protocol: "shadowsocks", Cipher: "aes-128-gcm", Plugin: "obfs"}
+	if err := validateNodeRuntime(cfg, []string{"shadowsocks"}, spec, core.TLSCert{}); err == nil || !strings.Contains(err.Error(), "plugin") {
+		t.Fatalf("expected plugin error, got %v", err)
+	}
+	spec.Plugin = ""
+	if err := validateNodeRuntime(cfg, []string{"shadowsocks"}, spec, core.TLSCert{}); err != nil {
+		t.Fatalf("plain shadowsocks rejected: %v", err)
 	}
 }

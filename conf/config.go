@@ -25,8 +25,6 @@ type Config struct {
 	Kernel     KernelConfig      `yaml:"kernel"`
 	Cert       CertConfig        `yaml:"cert"`
 	Log        LogConfig         `yaml:"log"`
-	Runtime    RuntimeConfig     `yaml:"runtime"`
-	WS         WSConfig          `yaml:"ws"`
 	Standalone *StandaloneConfig `yaml:"standalone,omitempty"`
 	HealthPort int               `yaml:"health_port"`
 	Nodes      []NodeEntry       `yaml:"nodes,omitempty"`
@@ -54,41 +52,28 @@ type KernelOverride struct {
 	CustomConfig string `yaml:"custom_config,omitempty"`
 }
 
-type RuntimeConfig struct {
-	GoMemLimit string `yaml:"gomemlimit"`
-
-	GoGCPercent int `yaml:"gogc"`
-}
-
 type PanelConfig struct {
-	URL       string `yaml:"url"`
-	Token     string `yaml:"token"`
-	TokenEnv  string `yaml:"token_env,omitempty"`
-	NodeID    int    `yaml:"node_id"`
-	NodeType  string `yaml:"node_type"`
+	URL      string `yaml:"url"`
+	Token    string `yaml:"token"`
+	TokenEnv string `yaml:"token_env,omitempty"`
+	// NodeID and NodeType identify the node of a config returned by
+	// ExpandNodes. In the file they are the legacy single-node form, which
+	// loading moves into Nodes.
+	NodeID    int    `yaml:"node_id,omitempty"`
+	NodeType  string `yaml:"node_type,omitempty"`
 	MachineID int    `yaml:"-"`
 	// Timeout is the panel HTTP request timeout in seconds.
 	Timeout int `yaml:"timeout,omitempty"`
 }
 
 type NodeConfig struct {
-	PushInterval         int `yaml:"push_interval"`
-	PullInterval         int `yaml:"pull_interval"`
-	TrackInterval        int `yaml:"track_interval"`
-	DeviceReportInterval int `yaml:"device_report_interval"`
-	ReportMinTrafficKB   int `yaml:"report_min_traffic_kb"`
+	PushInterval       int `yaml:"push_interval"`
+	PullInterval       int `yaml:"pull_interval"`
+	ReportMinTrafficKB int `yaml:"report_min_traffic_kb"`
 	// SpeedLimit (Mbps) and DeviceLimit cap every user on the node; the
 	// smaller non-zero value of the node and the user limit applies.
 	SpeedLimit  int `yaml:"speed_limit,omitempty"`
 	DeviceLimit int `yaml:"device_limit,omitempty"`
-}
-
-type WSConfig struct {
-	StatusInterval    int `yaml:"status_interval"`
-	HandshakeTimeout  int `yaml:"handshake_timeout"`
-	BackoffInitial    int `yaml:"backoff_initial"`
-	BackoffMax        int `yaml:"backoff_max"`
-	DiscoveryInterval int `yaml:"discovery_interval"`
 }
 
 type KernelConfig struct {
@@ -97,10 +82,6 @@ type KernelConfig struct {
 	LogLevel  string `yaml:"log_level"`
 
 	GeoDataDir string `yaml:"geo_data_dir"`
-
-	CustomOutbound []map[string]any `yaml:"custom_outbound"`
-
-	CustomRoute []map[string]any `yaml:"custom_route"`
 
 	CustomConfig string `yaml:"custom_config"`
 
@@ -177,6 +158,7 @@ func LoadRoot(path string) (*RootConfig, error) {
 
 	baseDir := configBaseDir(path)
 
+	rc.MigrateLegacyNodes()
 	rc.applyEnvOverrides()
 	rc.resolveEnvRefs()
 
@@ -305,6 +287,7 @@ func Load(path string) (*Config, error) {
 
 	baseDir := configBaseDir(path)
 
+	cfg.migrateLegacyNode()
 	cfg.applyEnvOverrides()
 	cfg.resolveEnvRefs()
 	cfg.setDefaultsFrom(baseDir)
@@ -331,14 +314,6 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := envFirst("apiKey", "API_KEY"); v != "" {
 		c.Panel.Token = v
-	}
-	if v := envFirst("nodeID", "NODE_ID"); v != "" {
-		if id, err := strconv.Atoi(v); err == nil {
-			c.Panel.NodeID = id
-		}
-	}
-	if v := envFirst("nodeType", "NODE_TYPE"); v != "" {
-		c.Panel.NodeType = v
 	}
 	if v := envFirst("kernel", "KERNEL_TYPE"); v != "" {
 		c.Kernel.Type = v
@@ -370,6 +345,27 @@ func (c *Config) applyEnvOverrides() {
 		}
 		c.Machine.Token = v
 	}
+	if v := envFirst("nodeID", "NODE_ID"); v != "" {
+		if id, err := strconv.Atoi(v); err == nil {
+			c.overrideSingleNode(func(n *NodeEntry) { n.NodeID = id })
+		}
+	}
+	if v := envFirst("nodeType", "NODE_TYPE"); v != "" {
+		c.overrideSingleNode(func(n *NodeEntry) { n.NodeType = v })
+	}
+}
+
+// overrideSingleNode applies an environment override to the only node,
+// creating it if needed. Multi-node, machine and standalone configs keep
+// their file settings.
+func (c *Config) overrideSingleNode(set func(*NodeEntry)) {
+	if len(c.Nodes) > 1 || c.IsMachineMode() || c.IsStandalone() {
+		return
+	}
+	if len(c.Nodes) == 0 {
+		c.Nodes = []NodeEntry{{}}
+	}
+	set(&c.Nodes[0])
 }
 
 func (c *Config) resolveEnvRefs() {
@@ -394,12 +390,6 @@ func (c *Config) inheritFrom(parent *Config) {
 	if c.Node.PullInterval == 0 {
 		c.Node.PullInterval = parent.Node.PullInterval
 	}
-	if c.Node.TrackInterval == 0 {
-		c.Node.TrackInterval = parent.Node.TrackInterval
-	}
-	if c.Node.DeviceReportInterval == 0 {
-		c.Node.DeviceReportInterval = parent.Node.DeviceReportInterval
-	}
 	if c.Node.ReportMinTrafficKB == 0 {
 		c.Node.ReportMinTrafficKB = parent.Node.ReportMinTrafficKB
 	}
@@ -408,27 +398,6 @@ func (c *Config) inheritFrom(parent *Config) {
 	}
 	if c.Node.DeviceLimit == 0 {
 		c.Node.DeviceLimit = parent.Node.DeviceLimit
-	}
-	if c.WS.StatusInterval == 0 {
-		c.WS.StatusInterval = parent.WS.StatusInterval
-	}
-	if c.WS.HandshakeTimeout == 0 {
-		c.WS.HandshakeTimeout = parent.WS.HandshakeTimeout
-	}
-	if c.WS.BackoffInitial == 0 {
-		c.WS.BackoffInitial = parent.WS.BackoffInitial
-	}
-	if c.WS.BackoffMax == 0 {
-		c.WS.BackoffMax = parent.WS.BackoffMax
-	}
-	if c.WS.DiscoveryInterval == 0 {
-		c.WS.DiscoveryInterval = parent.WS.DiscoveryInterval
-	}
-	if c.Runtime.GoGCPercent == 0 {
-		c.Runtime.GoGCPercent = parent.Runtime.GoGCPercent
-	}
-	if c.Runtime.GoMemLimit == "" {
-		c.Runtime.GoMemLimit = parent.Runtime.GoMemLimit
 	}
 	if c.Kernel.Type == "" {
 		c.Kernel.Type = parent.Kernel.Type
@@ -441,12 +410,6 @@ func (c *Config) inheritFrom(parent *Config) {
 	}
 	if c.Kernel.CustomConfig == "" {
 		c.Kernel.CustomConfig = parent.Kernel.CustomConfig
-	}
-	if len(c.Kernel.CustomOutbound) == 0 {
-		c.Kernel.CustomOutbound = parent.Kernel.CustomOutbound
-	}
-	if len(c.Kernel.CustomRoute) == 0 {
-		c.Kernel.CustomRoute = parent.Kernel.CustomRoute
 	}
 	if c.Kernel.XrayPolicy == nil {
 		c.Kernel.XrayPolicy = parent.Kernel.XrayPolicy
@@ -514,27 +477,6 @@ func (c *Config) setDefaultsFrom(baseDir string) {
 	}
 	if c.Cert.HTTPPort == 0 {
 		c.Cert.HTTPPort = 80
-	}
-	if c.WS.StatusInterval == 0 {
-		c.WS.StatusInterval = 10
-	}
-	if c.WS.HandshakeTimeout == 0 {
-		c.WS.HandshakeTimeout = 15
-	}
-	if c.WS.BackoffInitial == 0 {
-		c.WS.BackoffInitial = 1
-	}
-	if c.WS.BackoffMax == 0 {
-		c.WS.BackoffMax = 60
-	}
-	if c.WS.DiscoveryInterval == 0 {
-		c.WS.DiscoveryInterval = 300
-	}
-	if c.Node.TrackInterval == 0 {
-		c.Node.TrackInterval = 10
-	}
-	if c.Node.DeviceReportInterval == 0 {
-		c.Node.DeviceReportInterval = 30
 	}
 }
 
@@ -643,8 +585,8 @@ func (c *Config) validate() error {
 		if c.Panel.Token == "" {
 			return fmt.Errorf("panel.token is required")
 		}
-		if len(c.Nodes) == 0 && c.Panel.NodeID <= 0 {
-			return fmt.Errorf("panel.node_id must be positive (or use 'nodes:' for multi-node)")
+		if len(c.Nodes) == 0 {
+			return fmt.Errorf("nodes must list at least one node")
 		}
 		for i, n := range c.Nodes {
 			if n.NodeID <= 0 {
@@ -721,9 +663,6 @@ func (c *Config) ExpandNodes() []*Config {
 			}
 		} else {
 			nodeCfg.Kernel.ConfigDir = fmt.Sprintf("%s/node-%d", c.Kernel.ConfigDir, entry.NodeID)
-			if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
-				nodeCfg.Kernel.GeoDataDir = c.Kernel.GeoDataDir
-			}
 		}
 
 		if entry.Cert != nil {
@@ -750,9 +689,6 @@ func (c *Config) ExpandMachineNode(nodeID int, nodeType string) *Config {
 	nodeCfg.Panel.MachineID = c.Machine.MachineID
 
 	nodeCfg.Kernel.ConfigDir = fmt.Sprintf("%s/node-%d", c.Kernel.ConfigDir, nodeID)
-	if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
-		nodeCfg.Kernel.GeoDataDir = c.Kernel.GeoDataDir
-	}
 	nodeCfg.Cert.CertDir = filepath.Join(nodeCfg.Kernel.ConfigDir, "certs")
 
 	return &nodeCfg

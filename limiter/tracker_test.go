@@ -5,6 +5,12 @@ import (
 	"time"
 )
 
+func hasTraffic(t *Tracker) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.pendingTraffic) > 0
+}
+
 func TestProcess_InitialTraffic(t *testing.T) {
 	tr := NewTracker()
 	cumTraffic := map[int][2]int64{
@@ -72,7 +78,7 @@ func TestProcess_ZeroTraffic(t *testing.T) {
 	tr := NewTracker()
 	tr.Process(map[int][2]int64{}, nil, 0)
 
-	if tr.HasTraffic() {
+	if hasTraffic(tr) {
 		t.Error("expected no traffic for empty input")
 	}
 }
@@ -92,7 +98,7 @@ func TestFlushTraffic(t *testing.T) {
 		t.Errorf("flushed user 2: got %v", flushed[2])
 	}
 
-	if tr.HasTraffic() {
+	if hasTraffic(tr) {
 		t.Error("expected no traffic after flush")
 	}
 	flushed2 := tr.FlushTraffic(0)
@@ -108,7 +114,7 @@ func TestRestoreTraffic(t *testing.T) {
 	flushed := tr.FlushTraffic(0)
 	tr.RestoreTraffic(flushed)
 
-	if !tr.HasTraffic() {
+	if !hasTraffic(tr) {
 		t.Error("expected traffic after restore")
 	}
 
@@ -178,17 +184,17 @@ func TestAliveIPs_DedupSameIP(t *testing.T) {
 
 func TestHasTraffic(t *testing.T) {
 	tr := NewTracker()
-	if tr.HasTraffic() {
+	if hasTraffic(tr) {
 		t.Error("new tracker should not have traffic")
 	}
 
 	tr.Process(map[int][2]int64{1: {100, 200}}, nil, 1)
-	if !tr.HasTraffic() {
+	if !hasTraffic(tr) {
 		t.Error("should have traffic after process")
 	}
 
 	tr.FlushTraffic(0)
-	if tr.HasTraffic() {
+	if hasTraffic(tr) {
 		t.Error("should not have traffic after flush")
 	}
 }
@@ -200,7 +206,7 @@ func TestProcess_NoTrafficDelta(t *testing.T) {
 	tr.FlushTraffic(0)
 
 	tr.Process(map[int][2]int64{1: {100, 200}}, nil, 1)
-	if tr.HasTraffic() {
+	if hasTraffic(tr) {
 		t.Error("expected no traffic for zero delta")
 	}
 }
@@ -232,7 +238,7 @@ func TestFlushTrafficMinBytesKeepsSmallUsers(t *testing.T) {
 	if len(flushed) != 1 || flushed[2] != [2]int64{700, 400} {
 		t.Fatalf("accumulated flush = %v", flushed)
 	}
-	if tr.HasTraffic() {
+	if hasTraffic(tr) {
 		t.Fatal("expected no pending traffic")
 	}
 }

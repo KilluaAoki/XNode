@@ -46,6 +46,12 @@ type wsMessage struct {
 	Timestamp int64           `json:"timestamp,omitempty"`
 }
 
+// rawText defers the string conversion of a payload until a log line is
+// actually written.
+type rawText []byte
+
+func (r rawText) String() string { return string(r) }
+
 type syncConfigPayload struct {
 	Config    NodeConfig `json:"config"`
 	Timestamp int64      `json:"timestamp"`
@@ -81,6 +87,14 @@ type WSClientConfig struct {
 	BackoffInitial   time.Duration
 	BackoffMax       time.Duration
 	MachineID        int
+
+	// PingInterval is how often the client sends a ping control frame.
+	PingInterval time.Duration
+	// ReadTimeout drops a connection that has delivered nothing, not even a
+	// pong, for this long. The panel also sends an app-level ping every 55s.
+	ReadTimeout time.Duration
+	// CloseWait bounds the wait for the panel to answer a close frame.
+	CloseWait time.Duration
 }
 
 type WSClient struct {
@@ -95,7 +109,7 @@ type WSClient struct {
 
 	connected atomic.Bool
 
-	writeCh chan wsMessage
+	writeCh atomic.Pointer[chan wsMessage]
 }
 
 func NewWSClient(wsURL string, token string, nodeID int, cfg WSClientConfig, onEvent func(WSEvent), onStatus func(WSStatusChange), onPing func() map[string]interface{}) *WSClient {
@@ -110,6 +124,15 @@ func NewWSClient(wsURL string, token string, nodeID int, cfg WSClientConfig, onE
 	}
 	if cfg.BackoffMax == 0 {
 		cfg.BackoffMax = 60 * time.Second
+	}
+	if cfg.PingInterval == 0 {
+		cfg.PingInterval = 30 * time.Second
+	}
+	if cfg.ReadTimeout == 0 {
+		cfg.ReadTimeout = 120 * time.Second
+	}
+	if cfg.CloseWait == 0 {
+		cfg.CloseWait = 5 * time.Second
 	}
 	return &WSClient{
 		wsURL:    wsURL,
@@ -200,6 +223,12 @@ func (w *WSClient) connect(ctx context.Context) error {
 	defer conn.Close()
 
 	conn.SetReadLimit(10 << 20)
+	extendRead := func() { conn.SetReadDeadline(time.Now().Add(w.cfg.ReadTimeout)) }
+	extendRead()
+	conn.SetPongHandler(func(string) error {
+		extendRead()
+		return nil
+	})
 
 	var firstMsg wsMessage
 	if err := conn.ReadJSON(&firstMsg); err != nil {
@@ -217,6 +246,10 @@ func (w *WSClient) connect(ctx context.Context) error {
 		return fmt.Errorf("auth failed: %s", errData.Message)
 	}
 
+	writeCh := make(chan wsMessage, 16)
+	w.writeCh.Store(&writeCh)
+	defer w.writeCh.Store(nil)
+
 	if firstMsg.Event != "auth.success" {
 		w.connected.Store(true)
 		w.notifyStatus(true)
@@ -228,10 +261,8 @@ func (w *WSClient) connect(ctx context.Context) error {
 
 	reportTicker := time.NewTicker(w.cfg.StatusInterval)
 	defer reportTicker.Stop()
-
-	writeCh := make(chan wsMessage, 16)
-	w.writeCh = writeCh
-	defer func() { w.writeCh = nil }()
+	pingTicker := time.NewTicker(w.cfg.PingInterval)
+	defer pingTicker.Stop()
 
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
@@ -246,7 +277,8 @@ func (w *WSClient) connect(ctx context.Context) error {
 				}
 				return
 			}
-			nlog.Core().Debug("ws recv", "event", msg.Event, "data", string(msg.Data))
+			extendRead()
+			nlog.Core().Debug("ws recv", "event", msg.Event, "data", rawText(msg.Data))
 			w.handleMessage(msg)
 			if msg.Event == "ping" {
 				select {
@@ -264,11 +296,20 @@ func (w *WSClient) connect(ctx context.Context) error {
 			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			conn.WriteMessage(websocket.CloseMessage,
 				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-			<-done
+			// The deferred Close unblocks the reader if the panel never answers.
+			select {
+			case <-done:
+			case <-time.After(w.cfg.CloseWait):
+			}
 			return nil
 
 		case err := <-errCh:
 			return fmt.Errorf("read: %w", err)
+
+		case <-pingTicker.C:
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+				return fmt.Errorf("ping: %w", err)
+			}
 
 		case <-reportTicker.C:
 			if w.onPing != nil {
@@ -286,7 +327,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 			}
 
 		case msg := <-writeCh:
-			nlog.Core().Debug("ws send", "event", msg.Event, "data", string(msg.Data))
+			nlog.Core().Debug("ws send", "event", msg.Event, "data", rawText(msg.Data))
 			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := conn.WriteJSON(msg); err != nil {
 				return fmt.Errorf("write: %w", err)
@@ -356,8 +397,10 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 
 	case WSEventSyncUsers:
 		nlog.Core().Debug("ws sync users event received")
+		// User lists can be large and match the REST shape, so they skip
+		// the weak decode.
 		var p syncUsersPayload
-		if err := decodeData(msg.Data, &p); err != nil {
+		if err := json.Unmarshal(msg.Data, &p); err != nil {
 			nlog.Core().Warn("ws: cannot decode users payload", "error", err)
 			return
 		}
@@ -371,7 +414,7 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 	case WSEventSyncUserDelta:
 		nlog.Core().Debug("ws sync user delta event received")
 		var p syncUserDeltaPayload
-		if err := decodeData(msg.Data, &p); err != nil {
+		if err := json.Unmarshal(msg.Data, &p); err != nil {
 			nlog.Core().Warn("ws: cannot decode user delta payload", "error", err)
 			return
 		}
@@ -436,31 +479,7 @@ func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string)
 		Timestamp: time.Now().Unix(),
 	}
 
-	select {
-	case w.writeCh <- msg:
-	default:
-		nlog.Core().Warn("ws write channel full, skipping device report")
-	}
-}
-
-func (w *WSClient) SendNodeStatus(nodeID int, stats map[string]interface{}) {
-	if !w.connected.Load() || stats == nil {
-		return
-	}
-	if nodeID > 0 {
-		stats["node_id"] = nodeID
-	}
-	data, _ := json.Marshal(stats)
-	msg := wsMessage{
-		Event:     "node.status",
-		Data:      data,
-		Timestamp: time.Now().Unix(),
-	}
-	select {
-	case w.writeCh <- msg:
-	default:
-		nlog.Core().Warn("ws write channel full, skipping node status")
-	}
+	w.queue(msg)
 }
 
 func (w *WSClient) SendRaw(event string, data json.RawMessage) {
@@ -474,9 +493,19 @@ func (w *WSClient) SendRaw(event string, data json.RawMessage) {
 		Timestamp: time.Now().Unix(),
 	}
 
+	w.queue(msg)
+}
+
+// queue hands msg to the writer of the current connection. Messages sent
+// while no connection is up are dropped.
+func (w *WSClient) queue(msg wsMessage) {
+	ch := w.writeCh.Load()
+	if ch == nil {
+		return
+	}
 	select {
-	case w.writeCh <- msg:
+	case *ch <- msg:
 	default:
-		nlog.Core().Warn("ws write channel full, skipping raw message", "event", event)
+		nlog.Core().Warn("ws write channel full, skipping message", "event", msg.Event)
 	}
 }

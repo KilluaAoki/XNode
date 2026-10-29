@@ -22,14 +22,6 @@ func buildConfig(kcfg conf.KernelConfig, nc *core.NodeSpec, users []core.UserSpe
 		tags[strings.ToLower(co.Tag)] = true
 	}
 
-	for _, co := range kcfg.CustomOutbound {
-		tag, _ := co["tag"].(string)
-		if tag != "" {
-			tags[strings.ToLower(tag)] = true
-		}
-		outbounds = append(outbounds, M(co))
-	}
-
 	if !tags["direct"] {
 		outbounds = append([]M{{"type": "direct", "tag": "direct"}}, outbounds...)
 	}
@@ -51,7 +43,7 @@ func buildConfig(kcfg conf.KernelConfig, nc *core.NodeSpec, users []core.UserSpe
 		cfg["inbounds"] = []M{inbound}
 	}
 
-	customRoutes := mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute)
+	customRoutes := nc.CustomRoutes
 	ruleSets := newRuleSetIndex(kcfg.GeoDataDir)
 	route := buildRoutes(nc.Routes, nc.CustomRouteRules, customRoutes, ruleSets)
 	if dns := buildDNS(nc.Routes, ruleSets); dns != nil {
@@ -124,13 +116,6 @@ func outboundConfigToSingbox(oc core.OutboundConfig) M {
 		m["proxy_tag"] = oc.ProxyTag
 	}
 	return m
-}
-
-func mergeRouteList(a, b []map[string]any) []map[string]any {
-	res := make([]map[string]any, 0, len(a)+len(b))
-	res = append(res, a...)
-	res = append(res, b...)
-	return res
 }
 
 func buildRoutes(panelRoutes []core.RouteRule, customRules []core.CustomRouteRule, custom []map[string]any, ruleSets *ruleSetIndex) M {
@@ -453,7 +438,7 @@ func mergeCustomSingbox(cfg M, kcfg conf.KernelConfig) {
 
 	if v, ok := custom["outbounds"]; ok {
 		if existing, ok := cfg["outbounds"].([]M); ok {
-			cfg["outbounds"] = core.MergeAppendList(existing, v)
+			cfg["outbounds"] = core.MergeOutbounds(existing, v)
 		}
 	}
 

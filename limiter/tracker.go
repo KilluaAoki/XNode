@@ -5,8 +5,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/KilluaAoki/XNode/common/nlog"
 )
 
 type snapshot struct {
@@ -148,12 +146,6 @@ func (t *Tracker) RestoreTraffic(data map[int][2]int64) {
 	t.mu.Unlock()
 }
 
-func (t *Tracker) HasTraffic() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return len(t.pendingTraffic) > 0
-}
-
 func (t *Tracker) AliveIPs() map[int][]string {
 	s := t.live.Load()
 	out := make(map[int][]string, len(s.aliveIPs))
@@ -201,11 +193,6 @@ func (t *Tracker) CurrentOnline() map[int]int {
 		cp[k] = v
 	}
 	return cp
-}
-
-func (t *Tracker) LogStats() {
-	s := t.live.Load()
-	nlog.TrackerStats(s.connCount, len(s.online))
 }
 
 func (t *Tracker) ActiveConnections() int {

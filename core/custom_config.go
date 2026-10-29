@@ -58,6 +58,31 @@ func MergeAppendList(dst []map[string]any, srcRaw any) []map[string]any {
 	return append(dst, srcList...)
 }
 
+// MergeOutbounds appends custom outbounds, except that one sharing a tag with
+// an existing outbound replaces it in place. This lets custom_config redefine
+// the built-in direct and block outbounds while keeping direct the default.
+func MergeOutbounds(dst []map[string]any, srcRaw any) []map[string]any {
+	srcList, ok := toSliceOfMaps(srcRaw)
+	if !ok {
+		return dst
+	}
+	index := make(map[string]int, len(dst))
+	for i, ob := range dst {
+		if tag, _ := ob["tag"].(string); tag != "" {
+			index[strings.ToLower(tag)] = i
+		}
+	}
+	for _, ob := range srcList {
+		tag, _ := ob["tag"].(string)
+		if i, ok := index[strings.ToLower(tag)]; ok && tag != "" {
+			dst[i] = ob
+			continue
+		}
+		dst = append(dst, ob)
+	}
+	return dst
+}
+
 func MergePrependList(dst []map[string]any, srcRaw any) []map[string]any {
 	srcList, ok := toSliceOfMaps(srcRaw)
 	if !ok {
@@ -112,32 +137,6 @@ func mapKeys(m map[string]any) []string {
 type outboundTagSource struct {
 	Tag    string
 	Source string
-}
-
-func collectAdditionalOutboundTagSources(path string, rawOutbounds []map[string]any) ([]outboundTagSource, error) {
-	sources := collectRawOutboundTagSources(rawOutbounds)
-	customSources, err := collectCustomConfigOutboundTagSources(path)
-	if err != nil {
-		return nil, err
-	}
-	sources = append(sources, customSources...)
-	return sources, nil
-}
-
-func collectRawOutboundTagSources(outbounds []map[string]any) []outboundTagSource {
-	if len(outbounds) == 0 {
-		return nil
-	}
-	sources := make([]outboundTagSource, 0, len(outbounds))
-	for i, outbound := range outbounds {
-		tag, _ := outbound["tag"].(string)
-		tag = strings.TrimSpace(tag)
-		if tag == "" {
-			continue
-		}
-		sources = append(sources, outboundTagSource{Tag: tag, Source: fmt.Sprintf("kernel.custom_outbound[%d]", i)})
-	}
-	return sources
 }
 
 func collectCustomConfigOutboundTagSources(path string) ([]outboundTagSource, error) {

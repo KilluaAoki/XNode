@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -289,4 +290,75 @@ func TestWSClient_DevicesPayloadAcceptsObjectLists(t *testing.T) {
 	if strings.Join(got.DeviceUsers[2], ",") != "3.3.3.3,4.4.4.4,5.5.5.5" {
 		t.Fatalf("user 2: got %v", got.DeviceUsers[2])
 	}
+}
+
+// stalledWSServer authenticates and then neither reads nor writes, so the
+// client's pings go unanswered.
+func stalledWSServer(t *testing.T, connects *atomic.Int32) *httptest.Server {
+	t.Helper()
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		connects.Add(1)
+		conn.WriteJSON(wsMessage{Event: "auth.success"})
+		<-r.Context().Done()
+	}))
+}
+
+func TestWSClient_ReadTimeoutReconnects(t *testing.T) {
+	var connects atomic.Int32
+	server := stalledWSServer(t, &connects)
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "http://")
+	ws := NewWSClient("ws://"+host, "stall-token", 1, WSClientConfig{BackoffInitial: 50 * time.Millisecond, PingInterval: 50 * time.Millisecond, ReadTimeout: 300 * time.Millisecond}, func(WSEvent) {}, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go ws.Run(ctx)
+
+	deadline := time.After(4 * time.Second)
+	for connects.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("expected a reconnect after read timeout, got %d connections", connects.Load())
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func TestWSClient_ShutdownDoesNotWaitForPeer(t *testing.T) {
+	var connects atomic.Int32
+	server := stalledWSServer(t, &connects)
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "http://")
+	ws := NewWSClient("ws://"+host, "stall-token", 1, WSClientConfig{CloseWait: 200 * time.Millisecond}, func(WSEvent) {}, nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		ws.Run(ctx)
+		close(stopped)
+	}()
+
+	for !ws.IsConnected() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancel while the peer ignored the close frame")
+	}
+}
+
+func TestWSClient_SendWhileDisconnectedIsNoop(t *testing.T) {
+	ws := NewWSClient("ws://127.0.0.1:1", "t", 1, WSClientConfig{}, func(WSEvent) {}, nil, nil)
+	ws.SendRaw("custom", json.RawMessage(`{}`))
+	ws.SendDeviceReport(map[int][]string{1: {"1.1.1.1"}})
 }

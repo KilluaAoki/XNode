@@ -1,8 +1,9 @@
 panel:
   url: "https://panel.example.com"
   token: "your-server-token"
-  node_id: 1
-  node_type: "vless"
+nodes:
+  - node_id: 1
+    node_type: "vless"
 kernel:
   type: "singbox"
 log:

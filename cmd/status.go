@@ -180,7 +180,7 @@ func collectRowsFromConfig() ([]instanceRow, error) {
 			ID:      inst.InstanceID,
 			Mode:    mode,
 			Panel:   inst.Panel.URL,
-			Target:  formatTarget(intPtr(inst.Panel.NodeID), machineIDPtr(inst)),
+			Target:  formatTarget(intPtr(firstNodeID(inst)), machineIDPtr(inst)),
 			Service: serviceStatus,
 			Health:  healthStatus,
 		})

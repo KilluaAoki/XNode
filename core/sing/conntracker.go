@@ -102,7 +102,11 @@ type ConnTracker struct {
 	users    map[int]*userStats
 	uuidMap  map[string]int
 	uuidByID map[int]string
-	connMap  map[string]connRef
+
+	// connMu guards connMap so per-connection bookkeeping does not contend
+	// with user lookups on usersMu.
+	connMu  sync.Mutex
+	connMap map[string]connRef
 
 	idCounter atomic.Int64
 
@@ -353,19 +357,6 @@ func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[i
 	return
 }
 
-func (t *ConnTracker) CloseByID(id string) bool {
-	t.usersMu.RLock()
-	ref, ok := t.connMap[id]
-	t.usersMu.RUnlock()
-	if !ok {
-		return false
-	}
-	if ref.closer != nil {
-		ref.closer.Close()
-	}
-	return true
-}
-
 func (t *ConnTracker) CloseByUUID(uuids ...string) int {
 	if len(uuids) == 0 {
 		return 0
@@ -375,13 +366,13 @@ func (t *ConnTracker) CloseByUUID(uuids ...string) int {
 		targets[uuid] = struct{}{}
 	}
 	var closers []io.Closer
-	t.usersMu.RLock()
+	t.connMu.Lock()
 	for _, ref := range t.connMap {
 		if _, ok := targets[ref.uuid]; ok && ref.closer != nil {
 			closers = append(closers, ref.closer)
 		}
 	}
-	t.usersMu.RUnlock()
+	t.connMu.Unlock()
 	for _, c := range closers {
 		c.Close()
 	}
@@ -389,9 +380,9 @@ func (t *ConnTracker) CloseByUUID(uuids ...string) int {
 }
 
 func (t *ConnTracker) addConnRef(connID, uuid string, closer io.Closer) {
-	t.usersMu.Lock()
+	t.connMu.Lock()
 	t.connMap[connID] = connRef{uuid: uuid, closer: closer}
-	t.usersMu.Unlock()
+	t.connMu.Unlock()
 }
 
 func (t *ConnTracker) ActiveCount() int {
@@ -407,69 +398,9 @@ func (t *ConnTracker) ActiveCount() int {
 }
 
 func (t *ConnTracker) removeConnRef(connID string) {
-	t.usersMu.Lock()
+	t.connMu.Lock()
 	delete(t.connMap, connID)
-	t.usersMu.Unlock()
-}
-
-type RateLimitedWriter struct {
-	writer  io.Writer
-	limiter *rate.Limiter
-	ctx     context.Context
-}
-
-func (w *RateLimitedWriter) Write(b []byte) (int, error) {
-	if burst := w.limiter.Burst(); len(b) > burst {
-		b = b[:burst]
-	}
-
-	if w.limiter.AllowN(time.Now(), len(b)) {
-		return w.writer.Write(b)
-	}
-
-	resv := w.limiter.ReserveN(time.Now(), len(b))
-	if delay := resv.Delay(); delay > 0 {
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-		case <-w.ctx.Done():
-			resv.Cancel()
-			return 0, w.ctx.Err()
-		}
-	}
-
-	return w.writer.Write(b)
-}
-
-type RateLimitedReadCloser struct {
-	reader  io.Reader
-	limiter *rate.Limiter
-	ctx     context.Context
-}
-
-func (r *RateLimitedReadCloser) Read(b []byte) (int, error) {
-	if burst := r.limiter.Burst(); len(b) > burst {
-		b = b[:burst]
-	}
-
-	n, err := r.reader.Read(b)
-	if n > 0 && r.limiter != nil {
-		if !r.limiter.AllowN(time.Now(), n) {
-			resv := r.limiter.ReserveN(time.Now(), n)
-			if delay := resv.Delay(); delay > 0 {
-				timer := time.NewTimer(delay)
-				defer timer.Stop()
-				select {
-				case <-timer.C:
-				case <-r.ctx.Done():
-					resv.Cancel()
-					return n, r.ctx.Err()
-				}
-			}
-		}
-	}
-	return n, err
+	t.connMu.Unlock()
 }
 
 type trackedConn struct {

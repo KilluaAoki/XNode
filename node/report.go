@@ -110,23 +110,12 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 	m["inbound_speed"] = s.tracker.InboundSpeed()
 	m["outbound_speed"] = s.tracker.OutboundSpeed()
 
-	if len(status.CPUPerCore) > 0 {
-		m["cpu_per_core"] = status.CPUPerCore
-	}
-
-	m["load"] = map[string]interface{}{
-		"load1":  status.Load1,
-		"load5":  status.Load5,
-		"load15": status.Load15,
-	}
-
 	m["speed_limiter"] = map[string]interface{}{
 		"has_limits":    s.speedTracker.HasLimits(),
 		"limited_users": s.speedTracker.LimitedUserCount(),
 	}
 
 	m["gc"] = map[string]interface{}{
-		"num_gc":        status.NumGC,
 		"last_pause_ms": status.LastPauseMS,
 	}
 
@@ -146,7 +135,6 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 	lm := s.limiter.SnapshotMetrics()
 	m["limits"] = map[string]interface{}{
 		"device_limit_events": lm.DeviceLimitEvents,
-		"speed_limited_users": s.speedTracker.LimitedUserCount(),
 	}
 
 	return m

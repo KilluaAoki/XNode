@@ -49,3 +49,20 @@ func TestSettingHelpers(t *testing.T) {
 		}
 	}
 }
+
+func TestComputeHashIgnoresPanelBaseConfig(t *testing.T) {
+	a := &NodeSpec{Protocol: "vless", ServerPort: 443}
+	b := *a
+	b.PushInterval, b.PullInterval = 30, 90
+	b.NodeReportMinTraffic, b.DeviceOnlineMinTraffic = 10, 20
+	if ComputeHash(a, nil) != ComputeHash(&b, nil) {
+		t.Fatal("base_config fields changed the kernel hash")
+	}
+	b.ServerPort = 8443
+	if ComputeHash(a, nil) == ComputeHash(&b, nil) {
+		t.Fatal("port change did not change the kernel hash")
+	}
+	if b.PushInterval != 30 {
+		t.Fatal("ComputeHash mutated its input")
+	}
+}

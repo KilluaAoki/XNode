@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/KilluaAoki/XNode/api/panel"
 	"github.com/KilluaAoki/XNode/common/nlog"
@@ -14,7 +13,6 @@ import (
 
 type PanelControlPlane struct {
 	cfg    conf.PanelConfig
-	wsCfg  conf.WSConfig
 	kcfg   conf.KernelConfig
 	client *panel.Client
 }
@@ -23,10 +21,9 @@ type panelPushClient struct {
 	inner *panel.WSClient
 }
 
-func NewPanelControlPlane(panelCfg conf.PanelConfig, wsCfg conf.WSConfig, kcfg conf.KernelConfig) *PanelControlPlane {
+func NewPanelControlPlane(panelCfg conf.PanelConfig, kcfg conf.KernelConfig) *PanelControlPlane {
 	return &PanelControlPlane{
 		cfg:    panelCfg,
-		wsCfg:  wsCfg,
 		kcfg:   kcfg,
 		client: panel.NewClient(panelCfg),
 	}
@@ -158,17 +155,11 @@ func (p *PanelControlPlane) Metrics() APIMetrics {
 }
 
 func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange, wsURL string) PushClient {
-	cfg := panel.WSClientConfig{
-		StatusInterval:   time.Duration(p.wsCfg.StatusInterval) * time.Second,
-		HandshakeTimeout: time.Duration(p.wsCfg.HandshakeTimeout) * time.Second,
-		BackoffInitial:   time.Duration(p.wsCfg.BackoffInitial) * time.Second,
-		BackoffMax:       time.Duration(p.wsCfg.BackoffMax) * time.Second,
-	}
 	inner := panel.NewWSClient(
 		wsURL,
 		p.cfg.Token,
 		p.cfg.NodeID,
-		cfg,
+		panel.WSClientConfig{},
 		func(event panel.WSEvent) {
 			translated, err := TranslateWSEvent(event, p.kcfg)
 			if err != nil {

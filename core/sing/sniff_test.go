@@ -22,8 +22,8 @@ func TestBuildConfig_SniffRuleFollowsDomainRules(t *testing.T) {
 
 	withDomain := base
 	withDomain.Routes = []panel.RouteRule{{ID: 1, Match: []string{"*.example.com"}, Action: "block"}}
-	kcfg := conf.KernelConfig{CustomRoute: []map[string]any{{"ip_cidr": []string{"1.1.1.1/32"}, "outbound": "block"}}}
-	cfg = buildConfig(kcfg, testNodeSpec(&withDomain), testUsers, core.TLSCert{})
+	withDomain.CustomRoutes = []map[string]any{{"ip_cidr": []string{"1.1.1.1/32"}, "outbound": "block"}}
+	cfg = buildConfig(conf.KernelConfig{}, testNodeSpec(&withDomain), testUsers, core.TLSCert{})
 	rules := cfg["route"].(M)["rules"].([]M)
 	if rules[0]["action"] != "sniff" || len(rules[0]) != 1 {
 		t.Fatalf("first rule = %v, want sniff", rules[0])

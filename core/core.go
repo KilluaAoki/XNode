@@ -10,15 +10,6 @@ import (
 	"golang.org/x/time/rate"
 )
 
-type Capabilities struct {
-	PerUserSpeedLimit    bool
-	DeviceLimit          bool
-	BuiltInTrafficStats  bool
-	AliveIPTracking      bool
-	ForceCloseConnection bool
-	ForceCloseUser       bool
-}
-
 type TLSCert struct {
 	CertPEM []byte
 	KeyPEM  []byte
@@ -31,7 +22,6 @@ func (t TLSCert) HasCert() bool {
 type Kernel interface {
 	Name() string
 	Protocols() []string
-	Capabilities() Capabilities
 
 	Start(nodeConfig *NodeSpec, users []UserSpec, tls TLSCert) error
 	Stop()
@@ -43,8 +33,6 @@ type Kernel interface {
 	UpdateUsers(users []UserSpec) (added, removed int, err error)
 
 	GetUserTraffic(ctx context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error)
-	CloseConnection(ctx context.Context, connID string) error
-	CloseUserConnections(ctx context.Context, uuid string) error
 	SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter)
 	SetDeviceLimitFunc(fn func(uuid string) (int, bool))
 	UpdateGlobalDevices(users map[int][]string)
@@ -60,8 +48,16 @@ type ConnectionCounter interface {
 	TotalConnections() int64
 }
 
+// ComputeHash fingerprints what the kernel is built from. Panel base_config
+// values only steer the node service, so they are left out.
 func ComputeHash(nc *NodeSpec, users []UserSpec) string {
 	h := sha256.New()
+	if nc != nil {
+		k := *nc
+		k.NodeReportMinTraffic, k.DeviceOnlineMinTraffic = 0, 0
+		k.PushInterval, k.PullInterval = 0, 0
+		nc = &k
+	}
 	configData, _ := json.Marshal(nc)
 	h.Write(configData)
 	sorted := make([]UserSpec, len(users))

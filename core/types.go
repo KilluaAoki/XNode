@@ -59,6 +59,9 @@ type NodeSpec struct {
 	// Panel base_config traffic thresholds in KB.
 	NodeReportMinTraffic   int
 	DeviceOnlineMinTraffic int
+	// Panel base_config push/pull intervals in seconds; 0 when unset.
+	PushInterval int
+	PullInterval int
 }
 
 type OutboundConfig struct {

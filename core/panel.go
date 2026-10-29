@@ -127,6 +127,8 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 		IgnoreClientBandwidth:  nc.IgnoreClientBandwidth,
 		NodeReportMinTraffic:   nc.BaseConfig.NodeReportMinTraffic,
 		DeviceOnlineMinTraffic: nc.BaseConfig.DeviceOnlineMinTraffic,
+		PushInterval:           nc.BaseConfig.PushInterval,
+		PullInterval:           nc.BaseConfig.PullInterval,
 	}
 }
 
@@ -270,6 +272,8 @@ func (n *NodeSpec) ToPanel() *panel.NodeConfig {
 		ZeroRTTHandshake:      n.ZeroRTTHandshake,
 		IgnoreClientBandwidth: n.IgnoreClientBandwidth,
 		BaseConfig: panel.BaseConfig{
+			PushInterval:           n.PushInterval,
+			PullInterval:           n.PullInterval,
 			NodeReportMinTraffic:   n.NodeReportMinTraffic,
 			DeviceOnlineMinTraffic: n.DeviceOnlineMinTraffic,
 		},

@@ -16,15 +16,8 @@ import (
 	"golang.org/x/time/rate"
 )
 
-func TestSingBoxCapabilities(t *testing.T) {
+func TestSingBoxProtocols(t *testing.T) {
 	s := New(conf.KernelConfig{Type: "sing-box"})
-	caps := s.Capabilities()
-	if !caps.PerUserSpeedLimit || !caps.DeviceLimit || !caps.AliveIPTracking || !caps.ForceCloseUser {
-		t.Fatalf("unexpected sing-box capabilities: %+v", caps)
-	}
-	if caps.BuiltInTrafficStats || caps.ForceCloseConnection {
-		t.Fatalf("unexpected sing-box capabilities: %+v", caps)
-	}
 	protocols := s.Protocols()
 	found := false
 	for _, protocol := range protocols {
@@ -163,17 +156,16 @@ func TestConnTrackerCheckDeviceGateMergesFreshGlobalDevices(t *testing.T) {
 	}
 }
 
-func TestConnTrackerCloseByIDClosesTrackedConnection(t *testing.T) {
+func TestConnTrackerCloseByUUIDClosesTrackedConnection(t *testing.T) {
 	tracker := NewConnTracker(0)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	base := &testConn{}
 	wrapped := tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
-	tracked, ok := wrapped.(*trackedConn)
-	if !ok {
+	if _, ok := wrapped.(*trackedConn); !ok {
 		t.Fatalf("wrapped type = %T, want *trackedConn", wrapped)
 	}
-	if !tracker.CloseByID(tracked.connID) {
-		t.Fatal("CloseByID() = false, want true")
+	if n := tracker.CloseByUUID("uuid-1"); n != 1 {
+		t.Fatalf("CloseByUUID() = %d, want 1", n)
 	}
 	if !base.closed {
 		t.Fatal("expected underlying connection to be closed")

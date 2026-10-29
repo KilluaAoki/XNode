@@ -2,6 +2,8 @@ package sing
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -500,12 +502,7 @@ func TestBuildConfig(t *testing.T) {
 }
 
 func TestBuildConfig_OutboundPriority(t *testing.T) {
-	kcfg := conf.KernelConfig{
-		LogLevel: "info",
-		CustomOutbound: []map[string]any{
-			{"tag": "block", "type": "dns"},
-		},
-	}
+	kcfg := conf.KernelConfig{LogLevel: "info"}
 	nc := &panel.NodeConfig{
 		Protocol:   "shadowsocks",
 		ServerPort: 111,
@@ -535,14 +532,31 @@ func TestBuildConfig_OutboundPriority(t *testing.T) {
 		}
 		if tag == "block" {
 			foundBlock = true
-			if o["type"] != "dns" {
-				t.Errorf("expected 'block' outbound to be type 'dns' (static config priority), got %v", o["type"])
+			if o["type"] != "block" {
+				t.Errorf("expected default 'block' outbound, got %v", o["type"])
 			}
 		}
 	}
 
 	if !foundDirect || !foundBlock {
 		t.Errorf("missing outbounds: direct=%v, block=%v", foundDirect, foundBlock)
+	}
+}
+
+func TestBuildConfig_CustomConfigReplacesDirect(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "custom.yaml")
+	data := "outbounds:\n  - {tag: direct, type: direct, inet4_bind_address: 10.0.0.2}\n"
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nc := &panel.NodeConfig{Protocol: "shadowsocks", ServerPort: 111, Cipher: "aes-128-gcm"}
+
+	outbounds := buildConfig(conf.KernelConfig{CustomConfig: path}, testNodeSpec(nc), testUsers, core.TLSCert{})["outbounds"].([]M)
+	if len(outbounds) != 2 {
+		t.Fatalf("outbounds = %v", outbounds)
+	}
+	if outbounds[0]["tag"] != "direct" || outbounds[0]["inet4_bind_address"] != "10.0.0.2" {
+		t.Fatalf("first outbound = %v, want custom direct", outbounds[0])
 	}
 }
 

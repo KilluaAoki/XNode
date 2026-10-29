@@ -34,7 +34,8 @@ type Orchestrator struct {
 	ws       *panel.WSClient
 	wsCancel context.CancelFunc
 
-	runCtx context.Context
+	// rediscoverCh asks Run's loop for an immediate rediscovery.
+	rediscoverCh chan struct{}
 
 	pullInterval time.Duration
 	pushInterval time.Duration
@@ -52,11 +53,12 @@ func NewOrchestrator(cfg *conf.Config) *Orchestrator {
 		nodes:     make(map[int]*nodeHandle),
 		mailboxes: make(map[int]*NodeMailbox),
 		statuses:  make(map[int]chan<- StatusChange),
+
+		rediscoverCh: make(chan struct{}, 1),
 	}
 }
 
 func (o *Orchestrator) Run(ctx context.Context) error {
-	o.runCtx = ctx
 	nodesResp, err := o.client.GetMachineNodes()
 	if err != nil {
 		return fmt.Errorf("initial node discovery: %w", err)
@@ -84,7 +86,16 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			return nil
 
 		case <-discoveryTicker.C:
-			o.rediscover(ctx)
+			if o.rediscover(ctx) {
+				discoveryTicker.Reset(o.pullInterval)
+				statusTicker.Reset(o.pushInterval)
+			}
+
+		case <-o.rediscoverCh:
+			if o.rediscover(ctx) {
+				discoveryTicker.Reset(o.pullInterval)
+				statusTicker.Reset(o.pushInterval)
+			}
 
 		case <-statusTicker.C:
 			o.reportMachineStatus()
@@ -192,11 +203,19 @@ func (o *Orchestrator) stopAll() {
 	}
 }
 
-func (o *Orchestrator) rediscover(ctx context.Context) {
+// rediscover syncs the running nodes with the panel and reports whether
+// the panel changed the machine's push/pull intervals.
+func (o *Orchestrator) rediscover(ctx context.Context) bool {
 	nodesResp, err := o.client.GetMachineNodes()
 	if err != nil {
 		nlog.Core().Warn("machine node discovery failed", "error", err)
-		return
+		return false
+	}
+	pull, push := o.pullInterval, o.pushInterval
+	o.applyIntervals(nodesResp.BaseConfig)
+	intervalsChanged := pull != o.pullInterval || push != o.pushInterval
+	if intervalsChanged {
+		nlog.Core().Info("machine intervals updated", "pull", o.pullInterval, "push", o.pushInterval)
 	}
 
 	wanted := make(map[int]panel.MachineNode, len(nodesResp.Nodes))
@@ -220,6 +239,7 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 	for _, n := range nodesResp.Nodes {
 		o.startNode(ctx, n)
 	}
+	return intervalsChanged
 }
 
 func (o *Orchestrator) reportMachineStatus() {
@@ -246,13 +266,7 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 		return
 	}
 
-	wsCfg := panel.WSClientConfig{
-		StatusInterval:   time.Duration(o.cfg.WS.StatusInterval) * time.Second,
-		HandshakeTimeout: time.Duration(o.cfg.WS.HandshakeTimeout) * time.Second,
-		BackoffInitial:   time.Duration(o.cfg.WS.BackoffInitial) * time.Second,
-		BackoffMax:       time.Duration(o.cfg.WS.BackoffMax) * time.Second,
-		MachineID:        o.cfg.Machine.MachineID,
-	}
+	wsCfg := panel.WSClientConfig{MachineID: o.cfg.Machine.MachineID}
 
 	o.ws = panel.NewWSClient(
 		hs.WebSocket.WSURL,
@@ -274,7 +288,10 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
 	if event.Type == panel.WSEventSyncNodes {
 		nlog.Core().Info("machine received sync.nodes, triggering immediate rediscovery")
-		go o.rediscover(o.runCtx)
+		select {
+		case o.rediscoverCh <- struct{}{}:
+		default:
+		}
 		return
 	}
 

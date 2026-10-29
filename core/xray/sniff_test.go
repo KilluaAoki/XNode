@@ -37,8 +37,9 @@ func TestBuildConfig_SniffingFollowsDomainRules(t *testing.T) {
 		t.Fatalf("LoadJSONConfig() error = %v", err)
 	}
 
-	raw := conf.KernelConfig{CustomRoute: []map[string]any{{"protocol": []string{"bittorrent"}, "outboundTag": "block"}}}
-	cfg = buildConfig(raw, testNodeSpec(&base), testUsers, core.TLSCert{})
+	raw := base
+	raw.CustomRoutes = []map[string]any{{"protocol": []string{"bittorrent"}, "outboundTag": "block"}}
+	cfg = buildConfig(conf.KernelConfig{}, testNodeSpec(&raw), testUsers, core.TLSCert{})
 	if _, ok := cfg["inbounds"].([]M)[0]["sniffing"]; !ok {
 		t.Fatal("protocol rule should enable sniffing")
 	}

@@ -36,6 +36,9 @@ import (
 const (
 	drainTimeout = 5 * time.Second
 	startTimeout = 30 * time.Second
+	// recycleTimeout bounds how long a replaced instance keeps serving its
+	// established connections after a restart.
+	recycleTimeout = time.Minute
 )
 
 type Xray struct {
@@ -70,17 +73,6 @@ func New(cfg conf.KernelConfig) *Xray {
 
 func (x *Xray) Name() string { return "xray" }
 
-func (x *Xray) Capabilities() core.Capabilities {
-	return core.Capabilities{
-		PerUserSpeedLimit:    true,
-		DeviceLimit:          true,
-		BuiltInTrafficStats:  true,
-		AliveIPTracking:      true,
-		ForceCloseConnection: false,
-		ForceCloseUser:       true,
-	}
-}
-
 func (x *Xray) Protocols() []string {
 	return []string{
 		"vmess", "vless", "trojan", "shadowsocks",
@@ -89,19 +81,25 @@ func (x *Xray) Protocols() []string {
 }
 
 func (x *Xray) Start(nodeConfig *core.NodeSpec, users []core.UserSpec, tls core.TLSCert) error {
-	x.ensureGeoData(nodeConfig)
+	geoDir := x.ensureGeoData(nodeConfig)
 
 	data, err := marshalConfig(x.cfg, nodeConfig, users, tls)
 	if err != nil {
 		return err
 	}
 
+	// xray resolves geo files through a process-wide environment variable
+	// while parsing the config and building the router, so both steps run
+	// under the creation lock with the variable pointing at this kernel's dir.
+	xrayCreationMu.Lock()
+	if geoDir != "" {
+		os.Setenv("XRAY_LOCATION_ASSET", geoDir)
+	}
 	pbConfig, err := serial.LoadJSONConfig(bytes.NewReader(data))
 	if err != nil {
+		xrayCreationMu.Unlock()
 		return fmt.Errorf("parse xray config: %w", err)
 	}
-
-	xrayCreationMu.Lock()
 	inst, err := xrayCore.New(pbConfig)
 	ld := globalLimitDispatcher.Load()
 	xrayCreationMu.Unlock()
@@ -133,7 +131,10 @@ func (x *Xray) Start(nodeConfig *core.NodeSpec, users []core.UserSpec, tls core.
 	x.running.Store(true)
 	x.mu.Unlock()
 
-	closeOld(old, oldLD)
+	if old != nil {
+		stopAccepting(old)
+		go retire(old, oldLD, recycleTimeout)
+	}
 
 	x.updateDispatcherLimits(users)
 
@@ -173,10 +174,10 @@ func (x *Xray) Stop() {
 	x.limitDispatcher = nil
 	x.mu.Unlock()
 
-	if ld != nil {
-		drainConns(ld, drainTimeout)
+	if inst != nil {
+		stopAccepting(inst)
+		retire(inst, ld, drainTimeout)
 	}
-	closeOld(inst, ld)
 }
 
 func (x *Xray) IsRunning() bool { return x.running.Load() }
@@ -205,23 +206,6 @@ func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliv
 }
 
 func (x *Xray) TotalConnections() int64 { return x.totalConns.Load() }
-
-func (x *Xray) CloseConnection(_ context.Context, _ string) error {
-	return nil
-}
-
-func (x *Xray) CloseUserConnections(_ context.Context, uuid string) error {
-	x.mu.Lock()
-	var emails []string
-	for _, u := range x.users {
-		if u.UUID == uuid {
-			emails = append(emails, userEmail(u.ID))
-		}
-	}
-	x.mu.Unlock()
-	x.closeUserLinks(emails)
-	return nil
-}
 
 func (x *Xray) closeUserLinks(emails []string) {
 	if len(emails) == 0 {
@@ -304,7 +288,7 @@ func (x *Xray) AddUsers(users []core.UserSpec) (int, error) {
 	}
 
 	proto := x.protocol
-	nc := x.nodeConfig
+	nc, t := x.nodeConfig, x.tls
 	x.mu.Unlock()
 
 	ctx := context.Background()
@@ -316,8 +300,11 @@ func (x *Xray) AddUsers(users []core.UserSpec) (int, error) {
 			continue
 		}
 		if err := um.AddUser(ctx, mu); err != nil {
-			nlog.Core().Warn("xray: AddUser failed", "user", u.ID, "error", err)
-			continue
+			nlog.Core().Warn("xray: AddUser failed, restarting with full user list", "user", u.ID, "error", err)
+			if err := x.Start(nc, merged, t); err != nil {
+				return 0, err
+			}
+			return len(toAdd), nil
 		}
 		added++
 	}
@@ -425,7 +412,7 @@ func (x *Xray) UpdateUsers(users []core.UserSpec) (added, removed int, err error
 	}
 
 	proto := x.protocol
-	nc := x.nodeConfig
+	nc, t := x.nodeConfig, x.tls
 	x.mu.Unlock()
 
 	ctx := context.Background()
@@ -447,7 +434,13 @@ func (x *Xray) UpdateUsers(users []core.UserSpec) (added, removed int, err error
 			continue
 		}
 		if err := um.AddUser(ctx, mu); err != nil {
-			nlog.Core().Warn("xray: AddUser failed in UpdateUsers", "user", u.ID, "error", err)
+			// The live user set is now partial; rebuild the instance from
+			// the full list rather than leave users unable to connect.
+			nlog.Core().Warn("xray: AddUser failed, restarting with full user list", "user", u.ID, "error", err)
+			if startErr := x.Start(nc, users, t); startErr != nil {
+				return 0, 0, startErr
+			}
+			return added, removed, nil
 		}
 	}
 
@@ -578,17 +571,19 @@ func hexEncode(dst, src []byte) {
 	}
 }
 
-func (x *Xray) ensureGeoData(nc *core.NodeSpec) {
+// ensureGeoData fetches the geo databases the routes need and returns the
+// directory holding them, or "" when no route uses geo data.
+func (x *Xray) ensureGeoData(nc *core.NodeSpec) string {
 	sites, ips := core.GeoRuleNames(nc.Routes, nc.CustomRouteRules)
 	needIP, needSite := len(ips) > 0, len(sites) > 0
 	if !needIP && !needSite {
-		return
+		return ""
 	}
 	dir := x.cfg.GeoDataDir
 	if err := geodata.Ensure(dir, needIP, needSite); err != nil {
 		nlog.Core().Warn("geo database unavailable", "error", err)
 	}
-	os.Setenv("XRAY_LOCATION_ASSET", dir)
+	return dir
 }
 
 func marshalConfig(cfg conf.KernelConfig, nc *core.NodeSpec, users []core.UserSpec, tls core.TLSCert) ([]byte, error) {
@@ -617,20 +612,33 @@ func startWithTimeout(inst *xrayCore.Instance, timeout time.Duration) error {
 	}
 }
 
-func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
-	if inst == nil {
+// stopAccepting closes the listeners of inst. The inbounds use reusePort, so
+// without this a replaced instance keeps taking new connections with its old
+// configuration while it drains.
+func stopAccepting(inst *xrayCore.Instance) {
+	im, ok := inst.GetFeature(inbound.ManagerType()).(inbound.Manager)
+	if !ok {
 		return
 	}
-	go func() {
-		if ld != nil {
-			drainConns(ld, 5*time.Minute)
+	ctx := context.Background()
+	for _, h := range im.ListHandlers(ctx) {
+		if tag := h.Tag(); tag != "" {
+			im.RemoveHandler(ctx, tag)
 		}
-		inst.Close()
-		if ld != nil {
-			ld.ResetConns()
-		}
-		nlog.Core().Debug("xray: old instance recycled")
-	}()
+	}
+}
+
+// retire gives the established connections of inst up to timeout to finish,
+// then closes it.
+func retire(inst *xrayCore.Instance, ld *LimitDispatcher, timeout time.Duration) {
+	if ld != nil {
+		drainConns(ld, timeout)
+	}
+	inst.Close()
+	if ld != nil {
+		ld.ResetConns()
+	}
+	nlog.Core().Debug("xray: old instance recycled")
 }
 
 func drainConns(ld *LimitDispatcher, timeout time.Duration) {

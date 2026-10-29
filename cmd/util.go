@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"archive/zip"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -134,6 +136,42 @@ func extractZipFile(archive, name, dest string) error {
 		return out.Close()
 	}
 	return fmt.Errorf("%s not found in %s", name, filepath.Base(archive))
+}
+
+// checksumAsset is the sha256sum manifest published with every release.
+const checksumAsset = "sha256sums.txt"
+
+// verifyChecksum checks archive against the entry for asset in the
+// sha256sum-format manifest at sumsPath.
+func verifyChecksum(archive, sumsPath, asset string) error {
+	manifest, err := os.ReadFile(sumsPath)
+	if err != nil {
+		return err
+	}
+	var want string
+	for _, line := range strings.Split(string(manifest), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && strings.TrimPrefix(fields[1], "*") == asset {
+			want = strings.ToLower(fields[0])
+			break
+		}
+	}
+	if want == "" {
+		return fmt.Errorf("%s has no entry for %s", checksumAsset, asset)
+	}
+	f, err := os.Open(archive)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != want {
+		return fmt.Errorf("checksum mismatch for %s: got %s, want %s", asset, got, want)
+	}
+	return nil
 }
 
 func resolveDownloadURL(artifact, version string) string {

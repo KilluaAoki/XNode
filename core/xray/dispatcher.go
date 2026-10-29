@@ -286,14 +286,13 @@ func (d *LimitDispatcher) ResetConns() {
 }
 
 func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool, connCount int) {
-	d.mu.RLock()
-	emailToUID := d.emailToUID
-	limitedIPs := d.limitedIPs
-	d.mu.RUnlock()
-
 	aliveIPs = make(map[int]map[string]bool)
 
-	for email, ipsMap := range limitedIPs {
+	// limitedIPs is mutated in place by checkDeviceLimit and delConn, so it
+	// must be read under the lock.
+	d.mu.RLock()
+	emailToUID := d.emailToUID
+	for email, ipsMap := range d.limitedIPs {
 		uid := emailToUID[email]
 		if uid == 0 {
 			continue
@@ -306,6 +305,7 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 			aliveIPs[uid] = ipSet
 		}
 	}
+	d.mu.RUnlock()
 
 	d.unlimitedIPs.Range(func(key, value interface{}) bool {
 		email := key.(string)

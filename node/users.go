@@ -253,7 +253,7 @@ func subtractUsers(base, delta []core.UserSpec) []core.UserSpec {
 	return out
 }
 
-func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged bool) {
+func (s *Service) applyChanges(ctx context.Context, configChanged bool) {
 	if !configChanged {
 		return
 	}

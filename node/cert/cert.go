@@ -34,11 +34,20 @@ type Manager struct {
 
 	mat atomic.Pointer[certMaterial]
 
-	magic           *certmagic.Config
-	renewed         atomic.Bool
-	acmeStarted     bool
-	acmeFingerprint string
-	acmeCancel      context.CancelFunc
+	renewed atomic.Bool
+	acme    *acmeState
+}
+
+// acmeState is a running certmagic manager.
+type acmeState struct {
+	cache       *certmagic.Cache
+	cancel      context.CancelFunc
+	fingerprint string
+}
+
+func (a *acmeState) stop() {
+	a.cancel()
+	a.cache.Stop()
 }
 
 type certMaterial struct {
@@ -112,34 +121,38 @@ func (m *Manager) Reconfigure(ctx context.Context, newCfg conf.CertConfig) (bool
 		newCfg.ACMEStorageDir = m.cfg.ACMEStorageDir
 	}
 
-	if m.acmeStarted {
-		newFp := acmeFingerprint(newCfg)
+	// The running ACME manager and the current material stay in place until
+	// the new config starts, so a failed reconfigure keeps serving the old
+	// certificate instead of falling back to no TLS.
+	var prev *acmeState
+	if m.acme != nil {
 		newMode := resolveModeFor(newCfg)
-		if newMode != "http" && newMode != "dns" || newFp != m.acmeFingerprint {
-			m.tearDownACME()
+		if newMode != "http" && newMode != "dns" || acmeFingerprint(newCfg) != m.acme.fingerprint {
+			prev, m.acme = m.acme, nil
 		}
 	}
 
+	oldCfg, oldMat := m.cfg, m.mat.Load()
 	oldTLS := m.TLSCert()
 	m.cfg = newCfg
 
 	if err := m.Start(ctx); err != nil {
+		m.cfg = oldCfg
+		m.mat.Store(oldMat)
+		m.acme = prev
 		return false, fmt.Errorf("cert reconfigure: %w", err)
+	}
+	if prev != nil {
+		prev.stop()
+		// The old ACME certificate does not carry over to a mode that
+		// loads nothing (none).
+		if m.mat.Load() == oldMat {
+			m.mat.Store(nil)
+		}
 	}
 
 	newTLS := m.TLSCert()
 	return !pemEqual(oldTLS, newTLS), nil
-}
-
-func (m *Manager) tearDownACME() {
-	if m.acmeCancel != nil {
-		m.acmeCancel()
-		m.acmeCancel = nil
-	}
-	m.magic = nil
-	m.acmeStarted = false
-	m.acmeFingerprint = ""
-	m.mat.Store(nil)
 }
 
 func acmeFingerprint(cfg conf.CertConfig) string {
@@ -244,7 +257,12 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 }
 
-func (m *Manager) Stop() {}
+func (m *Manager) Stop() {
+	if m.acme != nil {
+		m.acme.stop()
+		m.acme = nil
+	}
+}
 
 func (m *Manager) startFile() error {
 	certPEM, err := os.ReadFile(m.cfg.CertFile)
@@ -333,7 +351,7 @@ func (m *Manager) startContent() error {
 }
 
 func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solver) error {
-	if m.acmeStarted {
+	if m.acme != nil {
 		return nil
 	}
 
@@ -350,6 +368,7 @@ func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solve
 	}
 
 	storage := &certmagic.FileStorage{Path: storageDir}
+	domain := m.cfg.Domain
 
 	var magic *certmagic.Config
 	cache := certmagic.NewCache(certmagic.CacheOptions{
@@ -371,12 +390,12 @@ func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solve
 			if issuerKey == "" {
 				return nil
 			}
-			if err := m.loadPEMFromStorage(evtCtx, storage, issuerKey, m.cfg.Domain); err != nil {
+			if err := m.loadPEMFromStorage(evtCtx, storage, issuerKey, domain); err != nil {
 				nlog.Core().Error("failed to reload cert after renewal", "error", err)
 				return nil
 			}
 			m.renewed.Store(true)
-			nlog.Core().Info("TLS certificate reloaded after renewal", "domain", m.cfg.Domain)
+			nlog.Core().Info("TLS certificate reloaded after renewal", "domain", domain)
 			return nil
 		},
 	})
@@ -402,29 +421,27 @@ func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solve
 	magic.Issuers = []certmagic.Issuer{
 		certmagic.NewACMEIssuer(magic, issuer),
 	}
-	m.magic = magic
 
 	acmeCtx, acmeCancel := context.WithCancel(ctx)
+	state := &acmeState{cache: cache, cancel: acmeCancel, fingerprint: acmeFingerprint(m.cfg)}
 
-	if err := magic.ObtainCertSync(acmeCtx, m.cfg.Domain); err != nil {
-		acmeCancel()
+	if err := magic.ObtainCertSync(acmeCtx, domain); err != nil {
+		state.stop()
 		return fmt.Errorf("obtain certificate: %w", err)
 	}
 
 	issuerKey := magic.Issuers[0].IssuerKey()
-	if err := m.loadPEMFromStorage(acmeCtx, storage, issuerKey, m.cfg.Domain); err != nil {
-		acmeCancel()
+	if err := m.loadPEMFromStorage(acmeCtx, storage, issuerKey, domain); err != nil {
+		state.stop()
 		return fmt.Errorf("load cert from storage: %w", err)
 	}
 
-	if err := magic.ManageAsync(acmeCtx, []string{m.cfg.Domain}); err != nil {
-		acmeCancel()
+	if err := magic.ManageAsync(acmeCtx, []string{domain}); err != nil {
+		state.stop()
 		return fmt.Errorf("start cert manager: %w", err)
 	}
 
-	m.acmeCancel = acmeCancel
-	m.acmeFingerprint = acmeFingerprint(m.cfg)
-	m.acmeStarted = true
+	m.acme = state
 	return nil
 }
 

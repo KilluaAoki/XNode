@@ -51,23 +51,21 @@
 
 ## Outgoing Address
 
-A local outbound tagged `direct` replaces the built-in one and stays the default.
+Outbounds in `kernel.custom_config` are written in the kernel's native format. One tagged `direct` replaces the built-in direct outbound and stays the default.
 
 ```yaml
-kernel:
-  type: "xray"
-  custom_outbound:
-    - { tag: "direct", protocol: "freedom", sendThrough: "203.0.113.2" }
+# kernel.custom_config for xray
+outbounds:
+  - { tag: "direct", protocol: "freedom", sendThrough: "203.0.113.2" }
 ```
 
 ```yaml
-kernel:
-  type: "singbox"
-  custom_outbound:
-    - { tag: "direct", type: "direct", inet4_bind_address: "203.0.113.2" }
+# kernel.custom_config for sing-box
+outbounds:
+  - { tag: "direct", type: "direct", inet4_bind_address: "203.0.113.2" }
 ```
 
 ## Best Practices
 
 - **Prefer** `custom_outbounds`: panel-managed, cross-kernel compatible
-- **Use** `kernel.custom_outbound` only: when native fields are needed
+- **Use** `kernel.custom_config` only: when native fields are needed

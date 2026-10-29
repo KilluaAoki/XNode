@@ -4,6 +4,8 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -339,5 +341,36 @@ func TestConfirmDefault(t *testing.T) {
 	feedInput(t, "")
 	if got, err := confirmDefault("q", true); got || !errors.Is(err, errCancelled) {
 		t.Fatalf("EOF: got %v, %v", got, err)
+	}
+}
+
+func TestVerifyChecksum(t *testing.T) {
+	dir := t.TempDir()
+	archive := filepath.Join(dir, "a.zip")
+	if err := os.WriteFile(archive, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("payload"))
+	good := hex.EncodeToString(sum[:])
+	writeSums := func(body string) string {
+		p := filepath.Join(dir, "sums.txt")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	other := strings.Repeat("0", 64)
+	if err := verifyChecksum(archive, writeSums(other+"  xnode-macos-64.zip\n"+good+"  xnode-linux-64.zip\n"), "xnode-linux-64.zip"); err != nil {
+		t.Fatalf("matching entry: %v", err)
+	}
+	if err := verifyChecksum(archive, writeSums(strings.ToUpper(good)+" *xnode-linux-64.zip\n"), "xnode-linux-64.zip"); err != nil {
+		t.Fatalf("binary-mode entry: %v", err)
+	}
+	if err := verifyChecksum(archive, writeSums(other+"  xnode-linux-64.zip\n"), "xnode-linux-64.zip"); err == nil {
+		t.Fatal("expected mismatch error")
+	}
+	if err := verifyChecksum(archive, writeSums(good+"  xnode-macos-64.zip\n"), "xnode-linux-64.zip"); err == nil {
+		t.Fatal("expected missing-entry error")
 	}
 }

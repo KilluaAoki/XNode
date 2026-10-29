@@ -54,10 +54,6 @@ func TestNodeSpecFromPanelValidated_RejectsDuplicateTagsAcrossSources(t *testing
 	}, conf.KernelConfig{
 		Type:         "singbox",
 		CustomConfig: customConfigPath,
-		CustomOutbound: []map[string]any{{
-			"tag":      "proxy",
-			"protocol": "socks",
-		}},
 	})
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -69,13 +65,13 @@ func TestNodeSpecFromPanelValidated_RejectsDuplicateTagsAcrossSources(t *testing
 
 func TestValidateOutboundTagCollisions_RejectsDuplicateRawSources(t *testing.T) {
 	err := validateOutboundTagCollisions(nil, []outboundTagSource{
-		{Tag: "warp", Source: "kernel.custom_outbound[0]"},
 		{Tag: "warp", Source: "kernel.custom_config.outbounds[0]"},
+		{Tag: "warp", Source: "kernel.custom_config.outbounds[1]"},
 	})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), `kernel.custom_config.outbounds[0].tag duplicates "warp" from kernel.custom_outbound[0]`) {
+	if !strings.Contains(err.Error(), `kernel.custom_config.outbounds[1].tag duplicates "warp" from kernel.custom_config.outbounds[0]`) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

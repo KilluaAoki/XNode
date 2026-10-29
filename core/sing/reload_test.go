@@ -162,8 +162,8 @@ func TestSingBoxSocksAuthFollowsUpdates(t *testing.T) {
 		}
 	}()
 
-	nc := panel.NodeConfig{Protocol: "socks", ServerPort: freePort(t)}
-	s := New(conf.KernelConfig{LogLevel: "error", CustomRoute: []map[string]any{{"ip_cidr": []string{"127.0.0.1/32"}, "outbound": "direct"}}})
+	nc := panel.NodeConfig{Protocol: "socks", ServerPort: freePort(t), CustomRoutes: []map[string]any{{"ip_cidr": []string{"127.0.0.1/32"}, "outbound": "direct"}}}
+	s := New(conf.KernelConfig{LogLevel: "error"})
 	if err := s.Start(core.NodeSpecFromPanel(&nc), reloadUsers(1), core.TLSCert{}); err != nil {
 		t.Fatalf("start: %v", err)
 	}

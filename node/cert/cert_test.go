@@ -214,3 +214,77 @@ func TestACMEFingerprintEnvOrderStable(t *testing.T) {
 		t.Fatal("fingerprint not order-independent")
 	}
 }
+
+func fakeACME(t *testing.T, cfg conf.CertConfig) (*acmeState, *bool) {
+	t.Helper()
+	cache := certmagic.NewCache(certmagic.CacheOptions{
+		GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) { return nil, nil },
+	})
+	stopped := false
+	_, cancel := context.WithCancel(context.Background())
+	return &acmeState{
+		cache:       cache,
+		cancel:      func() { stopped = true; cancel() },
+		fingerprint: acmeFingerprint(cfg),
+	}, &stopped
+}
+
+func TestReconfigureFailureKeepsACMECert(t *testing.T) {
+	acmeCfg := conf.CertConfig{CertMode: "http", Domain: "old.example.test"}
+	m := NewManager(acmeCfg)
+	certPEM, keyPEM := generateSelfSignedPair(t, "old.example.test")
+	m.mat.Store(&certMaterial{certPEM: certPEM, keyPEM: keyPEM})
+	state, stopped := fakeACME(t, acmeCfg)
+	m.acme = state
+
+	missing := filepath.Join(t.TempDir(), "missing.pem")
+	_, err := m.Reconfigure(context.Background(), conf.CertConfig{CertMode: "file", CertFile: missing, KeyFile: missing})
+	if err == nil {
+		t.Fatal("expected reconfigure to fail")
+	}
+	if !m.HasCert() || string(m.TLSCert().CertPEM) != string(certPEM) {
+		t.Fatal("failed reconfigure must keep the current certificate")
+	}
+	if m.acme != state || *stopped {
+		t.Fatal("failed reconfigure must keep the running ACME manager")
+	}
+	if m.cfg.CertMode != "http" || m.cfg.Domain != "old.example.test" {
+		t.Fatalf("failed reconfigure must restore the config, got %+v", m.cfg)
+	}
+
+	changed, err := m.Reconfigure(context.Background(), conf.CertConfig{CertMode: "none"})
+	if err != nil {
+		t.Fatalf("reconfigure to none: %v", err)
+	}
+	if !changed || m.HasCert() {
+		t.Fatal("switching from ACME to none should drop the ACME certificate")
+	}
+	if m.acme != nil || !*stopped {
+		t.Fatal("old ACME manager should be stopped after a successful switch")
+	}
+}
+
+func TestReconfigureSwitchesACMEToContent(t *testing.T) {
+	acmeCfg := conf.CertConfig{CertMode: "dns", Domain: "old.example.test", DNSProvider: "cloudflare"}
+	m := NewManager(acmeCfg)
+	oldCert, oldKey := generateSelfSignedPair(t, "old.example.test")
+	m.mat.Store(&certMaterial{certPEM: oldCert, keyPEM: oldKey})
+	state, stopped := fakeACME(t, acmeCfg)
+	m.acme = state
+
+	newCert, newKey := generateSelfSignedPair(t, "new.example.test")
+	changed, err := m.Reconfigure(context.Background(), conf.CertConfig{
+		CertMode:    "content",
+		CertContent: string(newCert),
+		KeyContent:  string(newKey),
+	})
+	if err != nil {
+		t.Fatalf("reconfigure: %v", err)
+	}
+	if !changed || string(m.TLSCert().CertPEM) != string(newCert) {
+		t.Fatal("expected the new content certificate")
+	}
+	if m.acme != nil || !*stopped {
+		t.Fatal("old ACME manager should be stopped")
+	}
+}

@@ -200,6 +200,14 @@ func runUpgrade(args []string) error {
 		if err := downloadFile(url, archive); err != nil {
 			return fmt.Errorf("download: %w", err)
 		}
+		sums := staged + ".sha256"
+		defer os.Remove(sums)
+		if err := downloadFile(resolveDownloadURL(checksumAsset, *ver), sums); err != nil {
+			return fmt.Errorf("download checksums: %w", err)
+		}
+		if err := verifyChecksum(archive, sums, asset); err != nil {
+			return err
+		}
 		if err := extractZipFile(archive, appName+exeSuffix, staged); err != nil {
 			return fmt.Errorf("extract: %w", err)
 		}

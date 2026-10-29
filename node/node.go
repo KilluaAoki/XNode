@@ -3,7 +3,6 @@ package node
 import (
 	"context"
 	"fmt"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +14,12 @@ import (
 	"github.com/KilluaAoki/XNode/core/xray"
 	"github.com/KilluaAoki/XNode/limiter"
 	"github.com/KilluaAoki/XNode/node/cert"
+)
+
+const (
+	trackInterval        = 10 * time.Second
+	deviceReportInterval = 30 * time.Second
+	wsDiscoveryInterval  = 5 * time.Minute
 )
 
 type Service struct {
@@ -43,6 +48,9 @@ type Service struct {
 
 	pushInterval int
 	pullInterval int
+	// reportTicker and pullTicker are owned by Run's loop; nil before it starts.
+	reportTicker *time.Ticker
+	pullTicker   *time.Ticker
 
 	lastUserHash   string
 	lastConfigHash string
@@ -114,7 +122,7 @@ func New(cfg *conf.Config) *Service {
 	if cfg.IsStandalone() {
 		cp = NewLocalControlPlane(cfg)
 	} else {
-		cp = NewPanelControlPlane(cfg.Panel, cfg.WS, cfg.Kernel)
+		cp = NewPanelControlPlane(cfg.Panel, cfg.Kernel)
 	}
 	return newService(cfg, cp)
 }
@@ -166,14 +174,13 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	defer s.kernel.Stop()
 
-	trackTicker := time.NewTicker(time.Duration(s.cfg.Node.TrackInterval) * time.Second)
-	pushInterval := time.Duration(math.Max(float64(s.pushInterval), 5)) * time.Second
-	pullInterval := time.Duration(s.pullInterval) * time.Second
-	reportTicker := time.NewTicker(pushInterval)
-	pullTicker := time.NewTicker(pullInterval)
-	deviceReportTicker := time.NewTicker(time.Duration(s.cfg.Node.DeviceReportInterval) * time.Second)
+	trackTicker := time.NewTicker(trackInterval)
+	reportTicker := time.NewTicker(pushPeriod(s.pushInterval))
+	pullTicker := time.NewTicker(time.Duration(s.pullInterval) * time.Second)
+	s.reportTicker, s.pullTicker = reportTicker, pullTicker
+	deviceReportTicker := time.NewTicker(deviceReportInterval)
 
-	wsDiscoveryTicker := time.NewTicker(time.Duration(s.cfg.WS.DiscoveryInterval) * time.Second)
+	wsDiscoveryTicker := time.NewTicker(wsDiscoveryInterval)
 
 	defer trackTicker.Stop()
 	defer reportTicker.Stop()
@@ -232,23 +239,7 @@ func (s *Service) initialSetup(ctx context.Context) error {
 		return err
 	}
 
-	if s.cfg.Node.PushInterval == 0 && bootstrap.PushInterval > 0 {
-		s.pushInterval = bootstrap.PushInterval
-	} else {
-		s.pushInterval = s.cfg.Node.PushInterval
-	}
-	if s.pushInterval == 0 {
-		s.pushInterval = 60
-	}
-
-	if s.cfg.Node.PullInterval == 0 && bootstrap.PullInterval > 0 {
-		s.pullInterval = bootstrap.PullInterval
-	} else {
-		s.pullInterval = s.cfg.Node.PullInterval
-	}
-	if s.pullInterval == 0 {
-		s.pullInterval = 60
-	}
+	s.applyIntervals(bootstrap.PushInterval, bootstrap.PullInterval)
 
 	if bootstrap.Push != nil {
 		s.wsClient = bootstrap.Push
@@ -271,6 +262,7 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	s.lastConfig = bootstrap.Config
 	s.metricsMu.Unlock()
 	s.lastConfigHash = computeConfigHash(bootstrap.Config)
+	s.applyIntervals(bootstrap.Config.PushInterval, bootstrap.Config.PullInterval)
 	bootstrap.Users = s.applyNodeLimits(bootstrap.Users)
 	s.setUserState(bootstrap.Users)
 
@@ -344,4 +336,40 @@ func (s *Service) applyNodeCert(ctx context.Context, newCfg *conf.CertConfig) bo
 		}
 	}
 	return changed
+}
+
+// applyIntervals takes the panel's push/pull intervals (seconds, 0 = not
+// sent) unless the local config pins them, and retimes the running tickers.
+func (s *Service) applyIntervals(panelPush, panelPull int) {
+	push := pickInterval(s.cfg.Node.PushInterval, panelPush, s.pushInterval)
+	pull := pickInterval(s.cfg.Node.PullInterval, panelPull, s.pullInterval)
+	if push == s.pushInterval && pull == s.pullInterval {
+		return
+	}
+	if s.reportTicker != nil {
+		nlog.Core().Info("panel intervals updated", "push", push, "pull", pull)
+	}
+	if s.reportTicker != nil && push != s.pushInterval {
+		s.reportTicker.Reset(pushPeriod(push))
+	}
+	if s.pullTicker != nil && pull != s.pullInterval {
+		s.pullTicker.Reset(time.Duration(pull) * time.Second)
+	}
+	s.pushInterval, s.pullInterval = push, pull
+}
+
+func pickInterval(local, panel, current int) int {
+	switch {
+	case local > 0:
+		return local
+	case panel > 0:
+		return panel
+	case current > 0:
+		return current
+	}
+	return 60
+}
+
+func pushPeriod(seconds int) time.Duration {
+	return time.Duration(max(seconds, 5)) * time.Second
 }

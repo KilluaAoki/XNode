@@ -15,13 +15,11 @@ import (
 )
 
 type fileRootConfig struct {
-	Log       *fileLogConfig     `yaml:"log,omitempty"`
-	Kernel    *fileKernelConfig  `yaml:"kernel,omitempty"`
-	Node      *fileNodeConfig    `yaml:"node,omitempty"`
-	WS        *conf.WSConfig     `yaml:"ws,omitempty"`
-	Runtime   *fileRuntimeConfig `yaml:"runtime,omitempty"`
-	Cert      *conf.CertConfig   `yaml:"cert,omitempty"`
-	Instances []fileInstance     `yaml:"instances,omitempty"`
+	Log       *fileLogConfig    `yaml:"log,omitempty"`
+	Kernel    *fileKernelConfig `yaml:"kernel,omitempty"`
+	Node      *fileNodeConfig   `yaml:"node,omitempty"`
+	Cert      *conf.CertConfig  `yaml:"cert,omitempty"`
+	Instances []fileInstance    `yaml:"instances,omitempty"`
 }
 
 type fileInstance struct {
@@ -30,20 +28,16 @@ type fileInstance struct {
 	Node       *fileNodeConfig    `yaml:"node,omitempty"`
 	Kernel     fileKernelConfig   `yaml:"kernel"`
 	Log        fileLogConfig      `yaml:"log"`
-	Runtime    *fileRuntimeConfig `yaml:"runtime,omitempty"`
 	HealthPort int                `yaml:"health_port,omitempty"`
 	Machine    *fileMachineConfig `yaml:"machine,omitempty"`
 	Standalone map[string]any     `yaml:"standalone,omitempty"`
 	Cert       *conf.CertConfig   `yaml:"cert,omitempty"`
-	WS         *conf.WSConfig     `yaml:"ws,omitempty"`
 	Nodes      []conf.NodeEntry   `yaml:"nodes,omitempty"`
 }
 
 type filePanelConfig struct {
 	URL      string `yaml:"url"`
 	TokenEnv string `yaml:"token_env,omitempty"`
-	NodeID   int    `yaml:"node_id,omitempty"`
-	NodeType string `yaml:"node_type,omitempty"`
 }
 
 type fileMachineConfig struct {
@@ -52,31 +46,22 @@ type fileMachineConfig struct {
 }
 
 type fileNodeConfig struct {
-	PushInterval         int `yaml:"push_interval,omitempty"`
-	PullInterval         int `yaml:"pull_interval,omitempty"`
-	TrackInterval        int `yaml:"track_interval,omitempty"`
-	DeviceReportInterval int `yaml:"device_report_interval,omitempty"`
-	ReportMinTrafficKB   int `yaml:"report_min_traffic_kb,omitempty"`
+	PushInterval       int `yaml:"push_interval,omitempty"`
+	PullInterval       int `yaml:"pull_interval,omitempty"`
+	ReportMinTrafficKB int `yaml:"report_min_traffic_kb,omitempty"`
 }
 
 type fileKernelConfig struct {
-	Type         string           `yaml:"type"`
-	ConfigDir    string           `yaml:"config_dir"`
-	LogLevel     string           `yaml:"log_level,omitempty"`
-	GeoDataDir   string           `yaml:"geo_data_dir,omitempty"`
-	CustomConfig string           `yaml:"custom_config,omitempty"`
-	CustomRoute  []map[string]any `yaml:"custom_route,omitempty"`
-	CustomOut    []map[string]any `yaml:"custom_outbound,omitempty"`
+	Type         string `yaml:"type"`
+	ConfigDir    string `yaml:"config_dir"`
+	LogLevel     string `yaml:"log_level,omitempty"`
+	GeoDataDir   string `yaml:"geo_data_dir,omitempty"`
+	CustomConfig string `yaml:"custom_config,omitempty"`
 }
 
 type fileLogConfig struct {
 	Level  string `yaml:"level,omitempty"`
 	Output string `yaml:"output,omitempty"`
-}
-
-type fileRuntimeConfig struct {
-	GoMemLimit  string `yaml:"gomemlimit,omitempty"`
-	GoGCPercent int    `yaml:"gogc,omitempty"`
 }
 
 type instanceSummary struct {
@@ -192,6 +177,7 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 
 	kept := make([]conf.Config, 0, len(instances))
 	removed := make([]conf.Config, 0, 1)
+	trimmed := 0
 	for _, inst := range instances {
 		var matched bool
 		if instanceID != "" {
@@ -200,7 +186,19 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 		} else {
 			matched = strings.TrimSpace(inst.Panel.URL) == strings.TrimSpace(panelURL)
 			if nodeID > 0 {
-				matched = matched && !inst.IsMachineMode() && inst.Panel.NodeID == nodeID
+				idx := nodeIndex(inst.Nodes, nodeID)
+				matched = matched && !inst.IsMachineMode() && idx >= 0
+				// Drop just the node when the instance serves others too,
+				// pinning the ID so its directories and credentials stay put.
+				if matched && len(inst.Nodes) > 1 {
+					if inst.InstanceID == "" {
+						inst.InstanceID, _ = inst.AutoInstanceID()
+					}
+					inst.Nodes = append(inst.Nodes[:idx:idx], inst.Nodes[idx+1:]...)
+					kept = append(kept, inst)
+					trimmed++
+					continue
+				}
 			}
 			if machineID > 0 {
 				matched = matched && inst.IsMachineMode() && inst.Machine != nil && inst.Machine.MachineID == machineID
@@ -212,7 +210,7 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 		}
 		kept = append(kept, inst)
 	}
-	if len(removed) == 0 {
+	if len(removed) == 0 && trimmed == 0 {
 		if instanceID != "" {
 			return fmt.Errorf("binding not found: id=%s", instanceID)
 		}
@@ -252,8 +250,24 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 	if err := detectServiceManager().restart(); err != nil {
 		return err
 	}
-	fmt.Printf(tr("removed %d binding(s)\n", "已删除 %d 个节点\n"), len(removed))
+	fmt.Printf(tr("removed %d binding(s)\n", "已删除 %d 个节点\n"), len(removed)+trimmed)
 	return nil
+}
+
+func nodeIndex(nodes []conf.NodeEntry, nodeID int) int {
+	for i, n := range nodes {
+		if n.NodeID == nodeID {
+			return i
+		}
+	}
+	return -1
+}
+
+func firstNodeID(inst *conf.Config) int {
+	if len(inst.Nodes) == 0 {
+		return 0
+	}
+	return inst.Nodes[0].NodeID
 }
 
 func loadWritableRootConfig(path string) (*conf.RootConfig, error) {
@@ -272,6 +286,7 @@ func loadWritableRootConfig(path string) (*conf.RootConfig, error) {
 		}
 		rc.Config = *legacy
 	}
+	rc.MigrateLegacyNodes()
 	return rc, nil
 }
 
@@ -301,18 +316,10 @@ func writeRootConfig(path string, root *conf.RootConfig) error {
 	}
 	if p.Node != (conf.NodeConfig{}) {
 		out.Node = &fileNodeConfig{
-			PushInterval:         p.Node.PushInterval,
-			PullInterval:         p.Node.PullInterval,
-			TrackInterval:        p.Node.TrackInterval,
-			DeviceReportInterval: p.Node.DeviceReportInterval,
-			ReportMinTrafficKB:   p.Node.ReportMinTrafficKB,
+			PushInterval:       p.Node.PushInterval,
+			PullInterval:       p.Node.PullInterval,
+			ReportMinTrafficKB: p.Node.ReportMinTrafficKB,
 		}
-	}
-	if p.Runtime.GoMemLimit != "" || p.Runtime.GoGCPercent != 0 {
-		out.Runtime = &fileRuntimeConfig{GoMemLimit: p.Runtime.GoMemLimit, GoGCPercent: p.Runtime.GoGCPercent}
-	}
-	if p.WS.StatusInterval != 0 || p.WS.HandshakeTimeout != 0 || p.WS.BackoffInitial != 0 {
-		out.WS = &p.WS
 	}
 	if p.Cert.CertMode != "" || p.Cert.Domain != "" || p.Cert.CertFile != "" || p.Cert.AutoTLS {
 		out.Cert = &p.Cert
@@ -324,8 +331,6 @@ func writeRootConfig(path string, root *conf.RootConfig) error {
 			Panel: filePanelConfig{
 				URL:      inst.Panel.URL,
 				TokenEnv: inst.Panel.TokenEnv,
-				NodeID:   inst.Panel.NodeID,
-				NodeType: inst.Panel.NodeType,
 			},
 			Kernel: fileKernelConfig{
 				Type:         inst.Kernel.Type,
@@ -333,8 +338,6 @@ func writeRootConfig(path string, root *conf.RootConfig) error {
 				LogLevel:     inst.Kernel.LogLevel,
 				GeoDataDir:   inst.Kernel.GeoDataDir,
 				CustomConfig: inst.Kernel.CustomConfig,
-				CustomRoute:  inst.Kernel.CustomRoute,
-				CustomOut:    inst.Kernel.CustomOutbound,
 			},
 			Log: fileLogConfig{
 				Level:  inst.Log.Level,
@@ -344,17 +347,9 @@ func writeRootConfig(path string, root *conf.RootConfig) error {
 		}
 		if !inst.IsMachineMode() && inst.Node != (conf.NodeConfig{}) {
 			fi.Node = &fileNodeConfig{
-				PushInterval:         inst.Node.PushInterval,
-				PullInterval:         inst.Node.PullInterval,
-				TrackInterval:        inst.Node.TrackInterval,
-				DeviceReportInterval: inst.Node.DeviceReportInterval,
-				ReportMinTrafficKB:   inst.Node.ReportMinTrafficKB,
-			}
-		}
-		if inst.Runtime.GoMemLimit != "" || inst.Runtime.GoGCPercent != 0 {
-			fi.Runtime = &fileRuntimeConfig{
-				GoMemLimit:  inst.Runtime.GoMemLimit,
-				GoGCPercent: inst.Runtime.GoGCPercent,
+				PushInterval:       inst.Node.PushInterval,
+				PullInterval:       inst.Node.PullInterval,
+				ReportMinTrafficKB: inst.Node.ReportMinTrafficKB,
 			}
 		}
 		if inst.IsMachineMode() && inst.Machine != nil {
@@ -362,16 +357,11 @@ func writeRootConfig(path string, root *conf.RootConfig) error {
 				MachineID: inst.Machine.MachineID,
 				TokenEnv:  inst.Machine.TokenEnv,
 			}
-			fi.Panel.NodeID = 0
-			fi.Panel.NodeType = ""
 		}
 		if inst.Cert.CertMode != "" || inst.Cert.Domain != "" || inst.Cert.CertFile != "" || inst.Cert.AutoTLS {
 			fi.Cert = &inst.Cert
 		}
-		if inst.WS.StatusInterval != 0 || inst.WS.HandshakeTimeout != 0 || inst.WS.BackoffInitial != 0 {
-			fi.WS = &inst.WS
-		}
-		if len(inst.Nodes) > 0 {
+		if !inst.IsMachineMode() {
 			fi.Nodes = inst.Nodes
 		}
 		out.Instances = append(out.Instances, fi)
@@ -513,7 +503,7 @@ func writeInstallMetaVersioned(path string, root *conf.RootConfig, ver, latestID
 			ID:         id,
 			PanelURL:   inst.Panel.URL,
 			Mode:       instanceMode(inst),
-			NodeID:     intPtr(inst.Panel.NodeID),
+			NodeID:     intPtr(firstNodeID(&inst)),
 			MachineID:  machineIDPtr(&inst),
 			HealthPort: inst.HealthPort,
 		}
@@ -547,8 +537,6 @@ type bindOptions struct {
 	machineID  int
 	kernel     string
 	healthPort int
-	gomemlimit string
-	gogc       int
 }
 
 func (o *bindOptions) register(fs *flag.FlagSet) {
@@ -570,8 +558,6 @@ func (o *bindOptions) register(fs *flag.FlagSet) {
 	}
 	fs.StringVar(&o.mode, "mode", "", "node or machine")
 	fs.IntVar(&o.healthPort, "health-port", defaultHealthPort, "local health port, 0 disables")
-	fs.StringVar(&o.gomemlimit, "gomemlimit", "", "runtime GOMEMLIMIT, e.g. 256MiB")
-	fs.IntVar(&o.gogc, "gogc", 0, "runtime GOGC")
 }
 
 func (o *bindOptions) normalize() error {
@@ -615,13 +601,11 @@ func bindInstance(o bindOptions) (string, error) {
 		Kernel:     conf.KernelConfig{Type: o.kernel, LogLevel: "warn"},
 		Log:        conf.LogConfig{Level: "info", Output: "stdout"},
 		HealthPort: o.healthPort,
-		Runtime:    conf.RuntimeConfig{GoMemLimit: o.gomemlimit, GoGCPercent: o.gogc},
 	}
 	if o.mode == "machine" {
 		inst.Machine = &conf.MachineConfig{MachineID: o.machineID}
 	} else {
-		inst.Panel.NodeID = o.nodeID
-		inst.Panel.NodeType = o.nodeType
+		inst.Nodes = []conf.NodeEntry{{NodeID: o.nodeID, NodeType: o.nodeType}}
 	}
 	instanceID, err := inst.AutoInstanceID()
 	if err != nil {

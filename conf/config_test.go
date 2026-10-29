@@ -40,11 +40,11 @@ log:
 	if cfg.Panel.Token != "secret-token" {
 		t.Errorf("token: got %q", cfg.Panel.Token)
 	}
-	if cfg.Panel.NodeID != 5 {
-		t.Errorf("node_id: got %d", cfg.Panel.NodeID)
+	if len(cfg.Nodes) != 1 || cfg.Nodes[0].NodeID != 5 || cfg.Nodes[0].NodeType != "v2ray" {
+		t.Errorf("nodes: got %+v", cfg.Nodes)
 	}
-	if cfg.Panel.NodeType != "v2ray" {
-		t.Errorf("node_type: got %q", cfg.Panel.NodeType)
+	if cfg.Panel.NodeID != 0 || cfg.Panel.NodeType != "" {
+		t.Errorf("panel node fields not cleared: %d %q", cfg.Panel.NodeID, cfg.Panel.NodeType)
 	}
 	if cfg.Kernel.Type != "singbox" {
 		t.Errorf("kernel.type: got %q", cfg.Kernel.Type)

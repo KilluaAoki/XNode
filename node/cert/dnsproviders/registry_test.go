@@ -5,29 +5,9 @@ import (
 	"testing"
 )
 
-func TestRegistryHasMainstreamProviders(t *testing.T) {
+func TestRegistryHasProviders(t *testing.T) {
 	cases := map[string][]string{
-		"cloudflare":     {"cf"},
-		"alidns":         {"aliyun"},
-		"tencentcloud":   {"tencent"},
-		"route53":        {"aws"},
-		"godaddy":        nil,
-		"namecheap":      nil,
-		"namesilo":       nil,
-		"digitalocean":   {"do"},
-		"linode":         nil,
-		"hetzner":        nil,
-		"gandi":          nil,
-		"porkbun":        nil,
-		"netlify":        nil,
-		"azure":          nil,
-		"googleclouddns": {"gcp", "gcloud"},
-		"huaweicloud":    {"huawei"},
-		"bunny":          nil,
-		"duckdns":        nil,
-		"ovh":            nil,
-		"vultr":          nil,
-		"desec":          nil,
+		"cloudflare": {"cf"},
 	}
 	for canonical, aliases := range cases {
 		if _, ok := Get(canonical); !ok {
@@ -51,16 +31,8 @@ func TestRegistryRejectsUnknown(t *testing.T) {
 }
 
 func TestProvidersValidateMissingEnv(t *testing.T) {
-	excluded := map[string]bool{
-		"route53":        true,
-		"azure":          true,
-		"googleclouddns": true,
-	}
 	for _, p := range List() {
 		canonical := p.Names[0]
-		if excluded[canonical] {
-			continue
-		}
 		t.Run(canonical, func(t *testing.T) {
 			_, err := p.Build(map[string]string{})
 			if err == nil {
