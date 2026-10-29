@@ -45,9 +45,8 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 		return orig, nil
 	}
 	ld := &LimitDispatcher{
-		inner:      orig,
-		innerDisp:  inner,
-		limitedIPs: make(map[string]map[string]int),
+		inner:     orig,
+		innerDisp: inner,
 	}
 	globalLimitDispatcher.Store(ld)
 	nlog.Core().Debug("xray: limit dispatcher installed")
@@ -58,13 +57,11 @@ type LimitDispatcher struct {
 	inner     interface{}
 	innerDisp routing.Dispatcher
 
-	mu            sync.RWMutex
-	limitedIPs    map[string]map[string]int
-	deviceLimits  map[string]int
-	emailToUID    map[string]int
-	speedLimiters map[string]*rate.Limiter
+	limits atomic.Pointer[limitState]
 
-	unlimitedIPs sync.Map
+	// conns maps an email to its *userConns. Each user has its own lock so
+	// new links of different users never contend.
+	conns sync.Map
 
 	gate atomic.Pointer[core.DeviceGate]
 
@@ -75,19 +72,23 @@ type LimitDispatcher struct {
 	links   map[string]map[*closeTrackingWriter]struct{}
 }
 
-type ipCounter struct {
-	ips sync.Map
+// limitState is replaced as a whole on every user update and read without
+// locking on the link path.
+type limitState struct {
+	emailToUID    map[string]int
+	deviceLimits  map[string]int
+	speedLimiters map[string]*rate.Limiter
 }
 
-func (ic *ipCounter) aliveIPs() map[string]bool {
-	result := make(map[string]bool)
-	ic.ips.Range(func(key, _ interface{}) bool {
-		if rv, ok := ic.ips.Load(key); ok && rv.(*atomic.Int64).Load() > 0 {
-			result[key.(string)] = true
-		}
-		return true
-	})
-	return result
+var noLimits = &limitState{}
+
+// userConns counts a user's open TCP links per source IP on this node.
+type userConns struct {
+	mu  sync.Mutex
+	ips map[string]int
+	// dead marks an entry dropped from LimitDispatcher.conns; a caller that
+	// locked it after the drop must look the user up again.
+	dead bool
 }
 
 func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
@@ -246,83 +247,75 @@ func (d *LimitDispatcher) Close() error {
 }
 
 func (d *LimitDispatcher) UpdateLimits(emailToUID, deviceLimits map[string]int, speedLimiters map[string]*rate.Limiter) {
-	d.mu.Lock()
-	d.emailToUID = emailToUID
-	d.deviceLimits = deviceLimits
-	d.speedLimiters = speedLimiters
-	d.mu.Unlock()
+	d.limits.Store(&limitState{
+		emailToUID:    emailToUID,
+		deviceLimits:  deviceLimits,
+		speedLimiters: speedLimiters,
+	})
+}
+
+func (d *LimitDispatcher) state() *limitState {
+	if st := d.limits.Load(); st != nil {
+		return st
+	}
+	return noLimits
 }
 
 func (d *LimitDispatcher) revoked(email string) bool {
 	if !strings.HasPrefix(email, "user@") {
 		return false
 	}
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	if d.emailToUID == nil {
+	st := d.state()
+	if st.emailToUID == nil {
 		return false
 	}
-	_, ok := d.emailToUID[email]
+	_, ok := st.emailToUID[email]
 	return !ok
 }
 
 func (d *LimitDispatcher) speedLimiter(email string) *rate.Limiter {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return d.speedLimiters[email]
+	return d.state().speedLimiters[email]
 }
 
 func (d *LimitDispatcher) ResetConns() {
-	d.mu.Lock()
-	d.limitedIPs = make(map[string]map[string]int)
-	d.mu.Unlock()
-
-	d.unlimitedIPs.Range(func(key, _ interface{}) bool {
-		d.unlimitedIPs.Delete(key)
+	d.conns.Range(func(key, value interface{}) bool {
+		uc := value.(*userConns)
+		uc.mu.Lock()
+		uc.dead = true
+		clear(uc.ips)
+		d.conns.CompareAndDelete(key, uc)
+		uc.mu.Unlock()
 		return true
 	})
 
 	d.connCount.Store(0)
 }
 
+// GetConnectionState also drops users without open links. Doing it here
+// rather than on every close keeps reconnecting users from reallocating
+// their entry each time.
 func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool, connCount int) {
 	aliveIPs = make(map[int]map[string]bool)
+	emailToUID := d.state().emailToUID
 
-	// limitedIPs is mutated in place by checkDeviceLimit and delConn, so it
-	// must be read under the lock.
-	d.mu.RLock()
-	emailToUID := d.emailToUID
-	for email, ipsMap := range d.limitedIPs {
-		uid := emailToUID[email]
-		if uid == 0 {
-			continue
-		}
-		ipSet := make(map[string]bool, len(ipsMap))
-		for ip := range ipsMap {
-			ipSet[ip] = true
-		}
-		if len(ipSet) > 0 {
-			aliveIPs[uid] = ipSet
-		}
-	}
-	d.mu.RUnlock()
-
-	d.unlimitedIPs.Range(func(key, value interface{}) bool {
+	d.conns.Range(func(key, value interface{}) bool {
 		email := key.(string)
-		uid := emailToUID[email]
-		if uid == 0 {
-			return true
-		}
-		ic := value.(*ipCounter)
-		if ips := ic.aliveIPs(); len(ips) > 0 {
-			if existing, ok := aliveIPs[uid]; ok {
-				for ip := range ips {
-					existing[ip] = true
-				}
-			} else {
-				aliveIPs[uid] = ips
+		uc := value.(*userConns)
+		uc.mu.Lock()
+		if len(uc.ips) == 0 {
+			uc.dead = true
+			d.conns.CompareAndDelete(email, uc)
+		} else if uid := emailToUID[email]; uid != 0 {
+			set := aliveIPs[uid]
+			if set == nil {
+				set = make(map[string]bool, len(uc.ips))
+				aliveIPs[uid] = set
+			}
+			for ip := range uc.ips {
+				set[ip] = true
 			}
 		}
+		uc.mu.Unlock()
 		return true
 	})
 
@@ -340,63 +333,65 @@ func (d *LimitDispatcher) SetConnCounter(c *atomic.Int64) {
 }
 
 // checkDeviceLimit reports whether a link from sourceIP must be rejected.
-// Accepted TCP links are counted until delConn.
+// Accepted TCP links are counted until delConn; UDP links are only checked.
 func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) bool {
-	d.mu.RLock()
-	limit, hasLimit := d.deviceLimits[email]
-	uid := d.emailToUID[email]
-	d.mu.RUnlock()
+	st := d.state()
+	limit := st.deviceLimits[email]
 
-	if !hasLimit || limit <= 0 {
-		if isTCP {
-			v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
-			ic := v.(*ipCounter)
-
-			rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
-			rv.(*atomic.Int64).Add(1)
+	if !isTCP {
+		if limit <= 0 {
+			return false
 		}
+		uc := d.loadConns(email)
+		if uc == nil {
+			return !d.gate.Load().Allow(st.emailToUID[email], nil, sourceIP, limit)
+		}
+		uc.mu.Lock()
+		allowed := d.gate.Load().Allow(st.emailToUID[email], uc.ips, sourceIP, limit)
+		uc.mu.Unlock()
+		return !allowed
+	}
+
+	for {
+		uc := d.loadConns(email)
+		if uc == nil {
+			v, _ := d.conns.LoadOrStore(email, &userConns{ips: make(map[string]int)})
+			uc = v.(*userConns)
+		}
+		uc.mu.Lock()
+		if uc.dead {
+			uc.mu.Unlock()
+			continue
+		}
+		if limit > 0 && !d.gate.Load().Allow(st.emailToUID[email], uc.ips, sourceIP, limit) {
+			uc.mu.Unlock()
+			return true
+		}
+		uc.ips[sourceIP]++
+		uc.mu.Unlock()
 		return false
 	}
-
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	ips := d.limitedIPs[email]
-	if !d.gate.Load().Allow(uid, ips, sourceIP, limit) {
-		return true
-	}
-	if isTCP {
-		if ips == nil {
-			ips = make(map[string]int)
-			d.limitedIPs[email] = ips
-		}
-		ips[sourceIP]++
-	}
-	return false
 }
 
 func (d *LimitDispatcher) delConn(email, sourceIP string) {
-	if v, ok := d.unlimitedIPs.Load(email); ok {
-		ic := v.(*ipCounter)
-		if rv, ok := ic.ips.Load(sourceIP); ok {
-			counter := rv.(*atomic.Int64)
-			if counter.Add(-1) <= 0 {
-				ic.ips.Delete(sourceIP)
-			}
-		}
+	uc := d.loadConns(email)
+	if uc == nil {
 		return
 	}
-
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if ips, ok := d.limitedIPs[email]; ok {
-		ips[sourceIP]--
-		if ips[sourceIP] <= 0 {
-			delete(ips, sourceIP)
-		}
-		if len(ips) == 0 {
-			delete(d.limitedIPs, email)
-		}
+	uc.mu.Lock()
+	if n := uc.ips[sourceIP] - 1; n > 0 {
+		uc.ips[sourceIP] = n
+	} else {
+		delete(uc.ips, sourceIP)
 	}
+	uc.mu.Unlock()
+}
+
+func (d *LimitDispatcher) loadConns(email string) *userConns {
+	if v, ok := d.conns.Load(email); ok {
+		return v.(*userConns)
+	}
+	return nil
 }
 
 type closeTrackingWriter struct {

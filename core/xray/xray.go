@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,7 +56,10 @@ type Xray struct {
 	inboundTag      string
 	lastKernelHash  string
 	cumTraffic      map[int][2]int64
-	speedLimitFunc  func(string) *rate.Limiter
+	// retired holds removed users whose final traffic is reported once more
+	// before their cumTraffic entry is dropped.
+	retired        map[int]struct{}
+	speedLimitFunc func(string) *rate.Limiter
 
 	// gate outlives instances so global device state survives restarts.
 	gate       *core.DeviceGate
@@ -67,6 +72,7 @@ func New(cfg conf.KernelConfig) *Xray {
 	return &Xray{
 		cfg:        cfg,
 		cumTraffic: make(map[int][2]int64),
+		retired:    make(map[int]struct{}),
 		gate:       core.NewDeviceGate(),
 	}
 }
@@ -127,6 +133,7 @@ func (x *Xray) Start(nodeConfig *core.NodeSpec, users []core.UserSpec, tls core.
 	x.protocol = nodeConfig.Protocol
 	x.inboundTag = nodeConfig.Protocol + "-in"
 	x.cumTraffic = make(map[int][2]int64)
+	x.retired = make(map[int]struct{})
 	x.lastKernelHash = core.ComputeHash(nodeConfig, users)
 	x.running.Store(true)
 	x.mu.Unlock()
@@ -374,6 +381,7 @@ func (x *Xray) RemoveUsers(users []core.UserSpec) (int, error) {
 	}
 	x.updateDispatcherLimits(kept)
 	x.closeUserLinks(emails)
+	x.retireUserStats(userIDs(users))
 
 	x.mu.Lock()
 	x.users = kept
@@ -427,6 +435,7 @@ func (x *Xray) UpdateUsers(users []core.UserSpec) (added, removed int, err error
 	}
 	x.updateDispatcherLimits(users)
 	x.closeUserLinks(emails)
+	x.retireUserStats(userIDs(toRemove))
 	for _, u := range toAdd {
 		mu, err := toMemoryUser(proto, nc, u)
 		if err != nil {
@@ -651,40 +660,107 @@ func drainConns(ld *LimitDispatcher, timeout time.Duration) {
 	}
 }
 
+func (x *Xray) statsManager() stats.Manager {
+	if x.instance == nil {
+		return nil
+	}
+	mgr, _ := x.instance.GetFeature(stats.ManagerType()).(stats.Manager)
+	return mgr
+}
+
+// aggregateStats drains the user traffic counters into cumTraffic and returns
+// the cumulative traffic of every user that has any. x.mu must be held.
 func (x *Xray) aggregateStats() (map[int][2]int64, error) {
-	sm := x.instance.GetFeature(stats.ManagerType())
-	if sm == nil {
-		return nil, nil
-	}
-	mgr, ok := sm.(stats.Manager)
-	if !ok {
+	mgr := x.statsManager()
+	if mgr == nil {
 		return nil, nil
 	}
 
-	traffic := make(map[int][2]int64)
-	for _, u := range x.users {
-		email := userEmail(u.ID)
+	// Only users that sent traffic have counters, so this walks the active
+	// users instead of the whole user list.
+	mgr.VisitCounters(func(name string, c stats.Counter) bool {
+		if id, dir, ok := parseUserCounter(name); ok {
+			x.addTraffic(id, dir, c.Set(0))
+		}
+		return true
+	})
 
-		var dUp, dDown int64
-		if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>uplink", email)); c != nil {
-			dUp = c.Set(0)
+	traffic := make(map[int][2]int64, len(x.cumTraffic))
+	for id, cum := range x.cumTraffic {
+		if cum[0] > 0 || cum[1] > 0 {
+			traffic[id] = cum
 		}
-		if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>downlink", email)); c != nil {
-			dDown = c.Set(0)
-		}
-
-		if dUp > 0 || dDown > 0 {
-			cum := x.cumTraffic[u.ID]
-			cum[0] += dUp
-			cum[1] += dDown
-			x.cumTraffic[u.ID] = cum
-		}
-
-		if cum := x.cumTraffic[u.ID]; cum[0] > 0 || cum[1] > 0 {
-			traffic[u.ID] = cum
-		}
+	}
+	for id := range x.retired {
+		delete(x.cumTraffic, id)
+		delete(x.retired, id)
 	}
 	return traffic, nil
+}
+
+func (x *Xray) addTraffic(id, dir int, n int64) {
+	if n <= 0 {
+		return
+	}
+	cum := x.cumTraffic[id]
+	cum[dir] += n
+	x.cumTraffic[id] = cum
+}
+
+// retireUserStats keeps the unreported traffic of removed users for the next
+// report and unregisters their counters, which xray never drops on its own.
+func (x *Xray) retireUserStats(ids []int) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	mgr := x.statsManager()
+	if mgr == nil {
+		return
+	}
+	for _, id := range ids {
+		for dir, suffix := range userCounterDirs {
+			name := userCounterPrefix + strconv.Itoa(id) + userCounterInfix + suffix
+			if c := mgr.GetCounter(name); c != nil {
+				x.addTraffic(id, dir, c.Set(0))
+				mgr.UnregisterCounter(name)
+			}
+		}
+		if _, ok := x.cumTraffic[id]; ok {
+			x.retired[id] = struct{}{}
+		}
+	}
+}
+
+const (
+	userCounterPrefix = "user>>>user@"
+	userCounterInfix  = ">>>traffic>>>"
+)
+
+// userCounterDirs is indexed like the [up, down] traffic pairs.
+var userCounterDirs = [2]string{"uplink", "downlink"}
+
+// parseUserCounter splits "user>>>user@<id>>>>traffic>>>uplink|downlink"
+// without allocating; dir is 0 for uplink and 1 for downlink.
+func parseUserCounter(name string) (id, dir int, ok bool) {
+	rest, ok := strings.CutPrefix(name, userCounterPrefix)
+	if !ok {
+		return 0, 0, false
+	}
+	idStr, suffix, ok := strings.Cut(rest, userCounterInfix)
+	if !ok {
+		return 0, 0, false
+	}
+	switch suffix {
+	case userCounterDirs[0]:
+	case userCounterDirs[1]:
+		dir = 1
+	default:
+		return 0, 0, false
+	}
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		return 0, 0, false
+	}
+	return id, dir, true
 }
 
 func (x *Xray) updateDispatcherLimits(users []core.UserSpec) {
@@ -714,6 +790,14 @@ func (x *Xray) updateDispatcherLimits(users []core.UserSpec) {
 	}
 
 	ld.UpdateLimits(emailToUID, deviceLimits, speedLimiters)
+}
+
+func userIDs(users []core.UserSpec) []int {
+	ids := make([]int, len(users))
+	for i, u := range users {
+		ids[i] = u.ID
+	}
+	return ids
 }
 
 func userSpeedLimiter(fn func(string) *rate.Limiter, u core.UserSpec) *rate.Limiter {

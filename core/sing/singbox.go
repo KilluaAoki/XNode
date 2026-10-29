@@ -20,8 +20,6 @@ import (
 	"github.com/KilluaAoki/XNode/conf"
 	"github.com/KilluaAoki/XNode/core"
 	"github.com/KilluaAoki/XNode/core/geodata"
-	"github.com/KilluaAoki/XNode/core/sing/protocol"
-	"github.com/KilluaAoki/XNode/core/sing/protocol/mieru"
 )
 
 type SingBox struct {
@@ -207,58 +205,15 @@ func (s *SingBox) updateUsersLocked(cfgMap M) error {
 		if !ok || existing.Type() != inb.Type {
 			return fmt.Errorf("inbound %s not found", inb.Tag)
 		}
-		if err := updateInboundUsers(existing, inb.Options); err != nil {
+		users, err := optionUsers(inb.Options)
+		if err == nil {
+			err = applyUsers(existing, users)
+		}
+		if err != nil {
 			return fmt.Errorf("inbound %s: %w", inb.Tag, err)
 		}
 	}
 	return nil
-}
-
-func updateInboundUsers(in adapter.Inbound, options any) error {
-	switch o := options.(type) {
-	case *option.VMessInboundOptions:
-		return updateUsers(in, o.Users)
-	case *option.VLESSInboundOptions:
-		return updateUsers(in, o.Users)
-	case *option.TrojanInboundOptions:
-		return updateUsers(in, o.Users)
-	case *option.HysteriaInboundOptions:
-		return updateUsers(in, o.Users)
-	case *option.Hysteria2InboundOptions:
-		return updateUsers(in, o.Users)
-	case *option.TUICInboundOptions:
-		return updateUsers(in, o.Users)
-	case *option.AnyTLSInboundOptions:
-		return updateUsers(in, o.Users)
-	case *mieru.InboundOptions:
-		return updateUsers(in, o.Users)
-	case *option.NaiveInboundOptions:
-		return updateUsers(in, o.Users)
-	case *option.SocksInboundOptions:
-		return updateUsers(in, o.Users)
-	case *option.HTTPMixedInboundOptions:
-		return updateUsers(in, o.Users)
-	case *option.ShadowsocksInboundOptions:
-		m, ok := in.(adapter.ManagedSSMServer)
-		if !ok {
-			return fmt.Errorf("%s does not support user updates", in.Type())
-		}
-		names := make([]string, len(o.Users))
-		passwords := make([]string, len(o.Users))
-		for i, u := range o.Users {
-			names[i], passwords[i] = u.Name, u.Password
-		}
-		return m.UpdateUsers(names, passwords)
-	}
-	return fmt.Errorf("%s does not support user updates", in.Type())
-}
-
-func updateUsers[T any](in adapter.Inbound, users []T) error {
-	u, ok := in.(protocol.UserUpdater[T])
-	if !ok {
-		return fmt.Errorf("%s does not support user updates", in.Type())
-	}
-	return u.UpdateUsers(users)
 }
 
 func structureKey(cfg M, hasUsers bool) string {
@@ -464,8 +419,42 @@ func (s *SingBox) closeRemovedLocked(uuids []string) {
 	}
 }
 
+// reloadInboundsLocked applies a new user list under the current node
+// config. Only the managed inbound's users change, so they are pushed to it
+// directly; the full config path runs when the inbound gains or loses all of
+// its users (part of the structure key) or the direct update fails.
 func (s *SingBox) reloadInboundsLocked(users []core.UserSpec) error {
-	return s.applyLocked(s.nodeConfig, users, s.tls)
+	if (len(users) > 0) != (len(s.users) > 0) {
+		return s.applyLocked(s.nodeConfig, users, s.tls)
+	}
+	// The tracker must know added users before the inbound accepts them.
+	if s.connTracker != nil {
+		s.connTracker.SetUserMap(buildUserMap(users))
+	}
+	if err := s.pushUsersLocked(users); err != nil {
+		nlog.Core().Warn("sing-box direct user update failed, rebuilding config", "error", err)
+		return s.applyLocked(s.nodeConfig, users, s.tls)
+	}
+	s.users = users
+	nlog.Core().Debug("sing-box users updated in place", "users", len(users))
+	return nil
+}
+
+func (s *SingBox) pushUsersLocked(users []core.UserSpec) error {
+	list, err := inboundUsers(s.nodeConfig, users)
+	if err != nil {
+		return err
+	}
+	im := service.FromContext[adapter.InboundManager](s.ctx)
+	if im == nil {
+		return fmt.Errorf("inbound manager not available")
+	}
+	tag := s.nodeConfig.Protocol + "-in"
+	in, ok := im.Get(tag)
+	if !ok {
+		return fmt.Errorf("inbound %s not found", tag)
+	}
+	return applyUsers(in, list)
 }
 
 func (s *SingBox) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {

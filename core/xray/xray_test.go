@@ -3,7 +3,6 @@ package xray
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"testing"
 
 	"github.com/KilluaAoki/XNode/conf"
@@ -62,14 +61,8 @@ func TestXrayGetUserTrafficUsesBuiltInStatsAndDispatcherState(t *testing.T) {
 	email1 := userEmail(1)
 	email2 := userEmail(2)
 	ld.UpdateLimits(map[string]int{email1: 1, email2: 2}, nil, nil)
-	ld.mu.Lock()
-	ld.limitedIPs[email1] = map[string]int{"1.1.1.1": 1}
-	ld.mu.Unlock()
-	ref := &atomic.Int64{}
-	ref.Store(1)
-	ic := &ipCounter{}
-	ic.ips.Store("2.2.2.2", ref)
-	ld.unlimitedIPs.Store(email2, ic)
+	ld.seedConns(email1, map[string]int{"1.1.1.1": 1})
+	ld.seedConns(email2, map[string]int{"2.2.2.2": 1})
 	ld.connCount.Store(7)
 
 	x, mgr := newStatsBackedXray(t, users, ld)
@@ -128,13 +121,13 @@ func TestXrayUpdateDispatcherLimitsPropagatesDeviceMetadata(t *testing.T) {
 
 	x.updateDispatcherLimits(users)
 
-	if got := ld.deviceLimits[userEmail(7)]; got != 2 {
+	if got := ld.state().deviceLimits[userEmail(7)]; got != 2 {
 		t.Fatalf("deviceLimits[email] = %d, want 2", got)
 	}
-	if got := ld.deviceLimits["uuid-7"]; got != 2 {
+	if got := ld.state().deviceLimits["uuid-7"]; got != 2 {
 		t.Fatalf("deviceLimits[uuid] = %d, want 2", got)
 	}
-	if _, ok := ld.deviceLimits[userEmail(9)]; ok {
+	if _, ok := ld.state().deviceLimits[userEmail(9)]; ok {
 		t.Fatal("unexpected device limit entry for unlimited user")
 	}
 }
@@ -205,7 +198,7 @@ func TestXrayUpdateUsersLimitOnlyRefreshesDispatcherLimits(t *testing.T) {
 	if added != 0 || removed != 0 {
 		t.Fatalf("UpdateUsers() counts = (%d, %d), want (0, 0)", added, removed)
 	}
-	if got := ld.deviceLimits[userEmail(1)]; got != 3 {
+	if got := ld.state().deviceLimits[userEmail(1)]; got != 3 {
 		t.Fatalf("device limit after refresh = %d, want 3", got)
 	}
 	if ld.speedLimiter(userEmail(1)) == nil {
@@ -230,5 +223,55 @@ func TestXrayRemoveUsersStopsKernelWhenLastUserRemoved(t *testing.T) {
 	}
 	if x.IsRunning() {
 		t.Fatal("expected xray to stop when last user is removed")
+	}
+}
+
+func TestParseUserCounter(t *testing.T) {
+	cases := []struct {
+		name    string
+		id, dir int
+		ok      bool
+	}{
+		{counterName(42, "uplink"), 42, 0, true},
+		{counterName(42, "downlink"), 42, 1, true},
+		{"inbound>>>vless-in>>>traffic>>>uplink", 0, 0, false},
+		{"user>>>user@x>>>traffic>>>uplink", 0, 0, false},
+		{"user>>>user@1>>>traffic>>>sideways", 0, 0, false},
+		{"user>>>user@1>>>online", 0, 0, false},
+	}
+	for _, tc := range cases {
+		id, dir, ok := parseUserCounter(tc.name)
+		if id != tc.id || dir != tc.dir || ok != tc.ok {
+			t.Errorf("parseUserCounter(%q) = %d, %d, %v; want %d, %d, %v", tc.name, id, dir, ok, tc.id, tc.dir, tc.ok)
+		}
+	}
+}
+
+func TestXrayRetiredUserTrafficReportedOnce(t *testing.T) {
+	x, mgr := newStatsBackedXray(t, []core.UserSpec{{ID: 1}, {ID: 2}}, nil)
+	up1 := mustRegisterCounter(t, mgr, counterName(1, "uplink"))
+	mustRegisterCounter(t, mgr, counterName(2, "downlink")).Add(5)
+	mustRegisterCounter(t, mgr, "inbound>>>vless-in>>>traffic>>>uplink").Add(999)
+	up1.Add(10)
+
+	if traffic, _ := x.aggregateStats(); traffic[1] != [2]int64{10, 0} || traffic[2] != [2]int64{0, 5} || len(traffic) != 2 {
+		t.Fatalf("first poll = %v", traffic)
+	}
+
+	up1.Add(7)
+	x.retireUserStats([]int{1})
+	if mgr.GetCounter(counterName(1, "uplink")) != nil {
+		t.Fatal("removed user's counter still registered")
+	}
+
+	if traffic, _ := x.aggregateStats(); traffic[1] != [2]int64{17, 0} {
+		t.Fatalf("poll after removal = %v, want user 1 at [17 0]", traffic)
+	}
+	traffic, _ := x.aggregateStats()
+	if _, ok := traffic[1]; ok {
+		t.Fatalf("removed user still reported: %v", traffic)
+	}
+	if traffic[2] != [2]int64{0, 5} {
+		t.Fatalf("remaining user = %v, want [0 5]", traffic[2])
 	}
 }

@@ -108,6 +108,11 @@ func TestSingBoxUserUpdatesStayInPlace(t *testing.T) {
 			defer s.Stop()
 			first := s.box
 
+			// A failed direct push silently falls back to the full config
+			// path, so check it on its own.
+			if err := s.pushUsersLocked(reloadUsers(1, 2)); err != nil {
+				t.Fatalf("direct user push: %v", err)
+			}
 			if _, _, err := s.UpdateUsers(reloadUsers(1, 2, 3)); err != nil {
 				t.Fatalf("update users: %v", err)
 			}

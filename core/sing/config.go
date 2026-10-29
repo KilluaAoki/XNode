@@ -1,7 +1,6 @@
 package sing
 
 import (
-	"encoding/base64"
 	"net"
 	"strconv"
 	"strings"
@@ -562,32 +561,17 @@ func buildShadowsocks(base M, nc *core.NodeSpec, users []core.UserSpec) M {
 	base["type"] = "shadowsocks"
 	base["method"] = nc.Cipher
 
-	ss2022, isSS2022 := ss2022Methods[nc.Cipher]
-	if isSS2022 {
+	if _, isSS2022 := ss2022Methods[nc.Cipher]; isSS2022 {
 		base["password"] = nc.ServerKey
 	}
 
 	userList := make([]M, len(users))
-	var rawBuf []byte
-	if isSS2022 {
-		rawBuf = make([]byte, ss2022.size)
-	}
-
 	for i := range users {
 		u := &users[i]
-		user := M{
+		userList[i] = M{
 			"name":     u.UUID,
-			"password": u.UUID,
+			"password": ssUserPassword(nc.Cipher, u.UUID),
 		}
-
-		if isSS2022 {
-			for j := range rawBuf {
-				rawBuf[j] = 0
-			}
-			copy(rawBuf, u.UUID)
-			user["password"] = base64.StdEncoding.EncodeToString(rawBuf)
-		}
-		userList[i] = user
 	}
 	base["users"] = userList
 

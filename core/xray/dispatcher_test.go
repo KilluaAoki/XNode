@@ -2,6 +2,8 @@ package xray
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,9 +20,12 @@ import (
 )
 
 func newTestDispatcher() *LimitDispatcher {
-	return &LimitDispatcher{
-		limitedIPs: make(map[string]map[string]int),
-	}
+	return &LimitDispatcher{}
+}
+
+// seedConns records open TCP links of email per source IP.
+func (d *LimitDispatcher) seedConns(email string, ips map[string]int) {
+	d.conns.Store(email, &userConns{ips: ips})
 }
 
 type nopReader struct{}
@@ -105,20 +110,8 @@ func TestLimitDispatcher_GetConnectionState(t *testing.T) {
 	email2 := userEmail(2)
 	ld.UpdateLimits(map[string]int{email1: 1, email2: 2}, nil, nil)
 
-	ic1 := &ipCounter{}
-	r1 := &atomic.Int64{}
-	r1.Store(1)
-	ic1.ips.Store("1.1.1.1", r1)
-	r2 := &atomic.Int64{}
-	r2.Store(1)
-	ic1.ips.Store("2.2.2.2", r2)
-	ld.unlimitedIPs.Store(email1, ic1)
-
-	ic2 := &ipCounter{}
-	r3 := &atomic.Int64{}
-	r3.Store(1)
-	ic2.ips.Store("3.3.3.3", r3)
-	ld.unlimitedIPs.Store(email2, ic2)
+	ld.seedConns(email1, map[string]int{"1.1.1.1": 1, "2.2.2.2": 1})
+	ld.seedConns(email2, map[string]int{"3.3.3.3": 1})
 
 	ld.connCount.Store(5)
 
@@ -138,18 +131,13 @@ func TestLimitDispatcher_GetConnectionState(t *testing.T) {
 func TestLimitDispatcher_ResetConns(t *testing.T) {
 	ld := newTestDispatcher()
 
-	ld.mu.Lock()
-	ld.limitedIPs["user@1"] = map[string]int{"1.1.1.1": 1}
-	ld.mu.Unlock()
+	ld.seedConns("user@1", map[string]int{"1.1.1.1": 1})
 	ld.connCount.Store(3)
 
 	ld.ResetConns()
 
-	ld.mu.RLock()
-	ipCount := len(ld.limitedIPs)
-	ld.mu.RUnlock()
-	if ipCount != 0 {
-		t.Error("limitedIPs should be empty after reset")
+	if ld.loadConns("user@1") != nil {
+		t.Error("conns should be empty after reset")
 	}
 
 	if ld.connCount.Load() != 0 {
@@ -170,14 +158,9 @@ func TestLimitDispatcher_UnlimitedUserFastPath(t *testing.T) {
 		}
 	}
 
-	v, ok := ld.unlimitedIPs.Load(email)
-	if !ok {
-		t.Error("unlimited user should have entry in unlimitedIPs")
-	}
-	ic := v.(*ipCounter)
-	ips := ic.aliveIPs()
-	if len(ips) == 0 {
-		t.Error("should have tracked some IPs")
+	uc := ld.loadConns(email)
+	if uc == nil || len(uc.ips) == 0 {
+		t.Error("unlimited user should have its IPs tracked")
 	}
 }
 
@@ -420,5 +403,63 @@ func TestLimitDispatcher_ConnectionStateConcurrentWithLinks(t *testing.T) {
 		default:
 			ld.GetConnectionState()
 		}
+	}
+}
+
+// Racing links from many IPs must never push a user past its device limit,
+// and dropping idle entries must not lose counts of links still open.
+func TestLimitDispatcher_DeviceLimitConcurrent(t *testing.T) {
+	ld := newTestDispatcher()
+	ld.SetDeviceGate(core.NewDeviceGate())
+	const email, limit = "user@1", 2
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: limit}, nil)
+
+	var wg sync.WaitGroup
+	var over atomic.Bool
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 2000; i++ {
+				ip := fmt.Sprintf("10.0.0.%d", (g+i)%5)
+				if ld.checkDeviceLimit(email, ip, true) {
+					continue
+				}
+				if uc := ld.loadConns(email); uc != nil {
+					uc.mu.Lock()
+					if len(uc.ips) > limit {
+						over.Store(true)
+					}
+					uc.mu.Unlock()
+				}
+				ld.delConn(email, ip)
+			}
+		}(g)
+	}
+	// Sweeping idle entries while links come and go exercises the retry
+	// on dropped entries.
+	stop := make(chan struct{})
+	swept := make(chan struct{})
+	go func() {
+		defer close(swept)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				ld.GetConnectionState()
+			}
+		}
+	}()
+	wg.Wait()
+	close(stop)
+	<-swept
+
+	if over.Load() {
+		t.Fatalf("more than %d devices online at once", limit)
+	}
+	ld.GetConnectionState()
+	if uc := ld.loadConns(email); uc != nil {
+		t.Fatalf("idle user still tracked: %v", uc.ips)
 	}
 }
