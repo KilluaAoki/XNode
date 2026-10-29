@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -579,5 +580,38 @@ func TestNewClient_Timeout(t *testing.T) {
 	}
 	if got := NewClient(conf.PanelConfig{Timeout: 5}).httpClient.Timeout; got != 5*time.Second {
 		t.Errorf("timeout = %v", got)
+	}
+}
+
+func TestDoRequest_ErrorRedactsToken(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	baseURL := ts.URL
+	ts.Close()
+
+	client := NewClient(conf.PanelConfig{URL: baseURL, Token: "secret-token", NodeID: 1})
+	_, err := client.doRequestOnce("GET", "/api/v1/server/UniProxy/config", nil, "", nil)
+	if err == nil {
+		t.Fatal("expected error from closed server")
+	}
+	if strings.Contains(err.Error(), "secret-token") {
+		t.Errorf("error leaks token: %v", err)
+	}
+	if !strings.Contains(err.Error(), "token=***") {
+		t.Errorf("error should keep redacted query for debugging: %v", err)
+	}
+}
+
+func TestRedactToken(t *testing.T) {
+	tests := []struct {
+		s, token, want string
+	}{
+		{"wss://h/ws?node_id=1&token=abc", "abc", "wss://h/ws?node_id=1&token=***"},
+		{"https://h/x?token=a%2Bb%2Fc", "a+b/c", "https://h/x?token=***"},
+		{"https://h/x?token=abc", "", "https://h/x?token=abc"},
+	}
+	for _, tt := range tests {
+		if got := redactToken(tt.s, tt.token); got != tt.want {
+			t.Errorf("redactToken(%q, %q) = %q, want %q", tt.s, tt.token, got, tt.want)
+		}
 	}
 }

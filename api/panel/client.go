@@ -601,7 +601,7 @@ func (c *Client) doRequestOnce(method, path string, body []byte, ifNoneMatch str
 
 	req, err := http.NewRequest(method, fullURL, bodyReader)
 	if err != nil {
-		return nil, err
+		return nil, c.redactErr(err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -618,7 +618,7 @@ func (c *Client) doRequestOnce(method, path string, body []byte, ifNoneMatch str
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		c.apiFailure.Add(1)
-		return nil, err
+		return nil, c.redactErr(err)
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
@@ -629,6 +629,25 @@ func (c *Client) doRequestOnce(method, path string, body []byte, ifNoneMatch str
 
 	nlog.Core().Debug("panel response", "method", method, "path", path, "status", resp.StatusCode)
 	return resp, nil
+}
+
+// redactErr masks the token in *url.Error, whose message embeds the full
+// request URL (GET requests carry the token in the query string).
+func (c *Client) redactErr(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		ue.URL = redactToken(ue.URL, c.token)
+	}
+	return err
+}
+
+// redactToken replaces every occurrence of token in s, raw or query-escaped.
+func redactToken(s, token string) string {
+	if token == "" {
+		return s
+	}
+	s = strings.ReplaceAll(s, url.QueryEscape(token), "***")
+	return strings.ReplaceAll(s, token, "***")
 }
 
 func drainAndClose(body io.ReadCloser) {
