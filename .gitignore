@@ -1,0 +1,13 @@
+/xnode
+/dist/
+*.exe
+
+config.yml
+config.json
+.env
+
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
